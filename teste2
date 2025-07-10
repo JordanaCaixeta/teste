@@ -1,0 +1,582 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+"""
+# Detecção de Drift em Numerários - Implementação Completa
+## Múltiplas opções de cálculo para análise comparativa
+## Usa dados reais: NUMERARIO_PRE_POS_PANDEMIA.csv
+"""
+
+# %% [markdown]
+# ## 1. Importações e Configurações
+
+# %%
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+from tqdm import tqdm
+import warnings
+from typing import Tuple, Dict, List, Optional
+
+warnings.filterwarnings('ignore')
+plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_palette("husl")
+
+# %% [markdown]
+# ## 2. Funções de Cálculo de P-valores - Múltiplas Implementações
+
+# %%
+def calcular_pvalores_erro_absoluto(y_true, y_pred, janela_dias=None, rtol=1e-03, atol=1e-03):
+    """
+    Calcula p-valores usando erro absoluto direto.
+    
+    Args:
+        y_true: Valores reais
+        y_pred: Valores preditos
+        janela_dias: Se especificado, compara apenas com os últimos N dias
+        
+    Returns:
+        p_det, p_rnd: P-valores determinísticos e randomizados
+    """
+    alpha = np.abs(y_true - y_pred)  # Score de não-conformidade = erro absoluto
+    N = len(alpha)
+    p_det = np.zeros(N)
+    p_rnd = np.zeros(N)
+    
+    for n in tqdm(range(N), desc="P-valores (erro absoluto)"):
+        if n == 0:
+            p_det[0] = 1.0
+            p_rnd[0] = 1.0
+            continue
+        
+        # Define janela de comparação
+        if janela_dias is not None and janela_dias < n:
+            inicio = n - janela_dias
+        else:
+            inicio = 0
+        
+        # Scores anteriores na janela
+        anteriores = alpha[inicio:n+1]
+        alpha_n = alpha[n]
+        
+        # P-valor determinístico
+        p_det[n] = np.mean(anteriores >= alpha_n)
+        
+        # P-valor randomizado
+        countG = np.sum(anteriores > alpha_n)
+        countE = np.sum(np.isclose(anteriores, alpha_n, rtol=rtol, atol=atol))
+        u = np.random.uniform() if countE > 0 else 0
+        p_rnd[n] = (countG + u * countE) / len(anteriores)
+    
+    return p_det, p_rnd
+
+# %%
+def calcular_pvalores_distancia(y_true, y_pred, metodo='min', janela_dias=None, rtol=1e-03, atol=1e-03):
+    """
+    Calcula p-valores usando distâncias entre observações (similar ao conformal_wine).
+    
+    Args:
+        y_true: Valores reais
+        y_pred: Valores preditos
+        metodo: 'min' para distância mínima, 'mean' para média
+        janela_dias: Se especificado, compara apenas com os últimos N dias
+        
+    Returns:
+        p_det, p_rnd: P-valores determinísticos e randomizados
+    """
+    # Cria vetor de erros
+    erros = y_true - y_pred
+    N = len(erros)
+    p_det = np.zeros(N)
+    p_rnd = np.zeros(N)
+    
+    for n in tqdm(range(N), desc=f"P-valores (distância {metodo})"):
+        if n == 0:
+            p_det[0] = 1.0
+            p_rnd[0] = 1.0
+            continue
+        
+        # Define janela
+        if janela_dias is not None and janela_dias < n:
+            inicio = n - janela_dias
+        else:
+            inicio = 0
+        
+        # Calcula scores de não-conformidade
+        rho = np.zeros(n - inicio + 1)
+        
+        for i in range(inicio, n + 1):
+            # Remove o próprio ponto
+            outros_idx = list(range(inicio, i)) + list(range(i + 1, n + 1))
+            
+            if len(outros_idx) == 0:
+                rho[i - inicio] = 0
+                continue
+            
+            # Distâncias para outros pontos
+            distancias = np.abs(erros[i] - erros[outros_idx])
+            
+            if metodo == 'min':
+                rho[i - inicio] = np.min(distancias)
+            elif metodo == 'mean':
+                rho[i - inicio] = np.mean(distancias)
+        
+        # Score atual
+        rho_n = rho[-1]
+        
+        # P-valores
+        p_det[n] = np.mean(rho >= rho_n)
+        
+        # Randomizado
+        countG = np.sum(rho > rho_n)
+        countE = np.sum(np.isclose(rho, rho_n, rtol=rtol, atol=atol))
+        u = np.random.uniform() if countE > 0 else 0
+        p_rnd[n] = (countG + u * countE) / len(rho)
+    
+    return p_det, p_rnd
+
+# %% [markdown]
+# ## 3. Funções de Martingale - Múltiplas Implementações
+
+# %%
+def power_martingale_cumprod(pvalues, epsilon=0.05):
+    """
+    Power Martingale usando produto cumulativo (cumprod).
+    """
+    # Evita log(0) e divisão por zero
+    pvalues = np.clip(pvalues, 1e-10, 1)
+    
+    # Função de aposta
+    betting = epsilon * (pvalues ** (epsilon - 1))
+    
+    # Produto cumulativo
+    martingale = np.cumprod(betting)
+    
+    return martingale
+
+# %%
+def power_martingale_incremental(pvalues, epsilon=0.05):
+    """
+    Power Martingale calculado incrementalmente.
+    """
+    pvalues = np.clip(pvalues, 1e-10, 1)
+    N = len(pvalues)
+    martingale = np.zeros(N)
+    
+    # Valor inicial
+    martingale[0] = epsilon * (pvalues[0] ** (epsilon - 1))
+    
+    # Cálculo incremental
+    for t in range(1, N):
+        betting = epsilon * (pvalues[t] ** (epsilon - 1))
+        martingale[t] = martingale[t-1] * betting
+    
+    return martingale
+
+# %%
+def simple_jumper_martingale(p_values, J=0.01):
+    """
+    Simple Jumper Martingale (sempre incremental por natureza).
+    """
+    n = len(p_values)
+    capital = np.zeros(n)
+    
+    # Estado inicial
+    C = {epsilon: 1/3 for epsilon in [-1, 0, 1]}
+    
+    for i in range(n):
+        # Transição Markoviana
+        C_new = {}
+        total = sum(C.values())
+        
+        for epsilon in [-1, 0, 1]:
+            C_new[epsilon] = (1 - J) * C[epsilon] + J * total / 3
+        
+        # Atualização com função de aposta
+        p = p_values[i]
+        for epsilon in [-1, 0, 1]:
+            f_eps = 1 + epsilon * (p - 0.5)
+            C_new[epsilon] *= f_eps
+        
+        # Capital total
+        capital[i] = sum(C_new.values())
+        C = C_new
+    
+    return capital
+
+# %% [markdown]
+# ## 4. Funções de Análise para Numerários
+
+# %%
+def load_numerarios_data(filepath='NUMERARIO_PRE_POS_PANDEMIA.csv'):
+    """
+    Carrega dados reais do Numerários.
+    """
+    try:
+        # Carrega o CSV
+        df = pd.read_csv(filepath)
+        
+        # Remove coluna de índice se existir
+        if 'Unnamed: 0' in df.columns or df.columns[0] == '':
+            df = df.drop(columns=df.columns[0])
+        
+        # Converte datas
+        date_columns = ['DATA', 'DATA_REFERENCIA', 'DATA_PREVISAO']
+        for col in date_columns:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+        
+        # Converte AGENCIA para inteiro
+        if 'AGENCIA' in df.columns:
+            df['AGENCIA'] = df['AGENCIA'].astype(int)
+        
+        print(f"✅ Dados carregados com sucesso!")
+        print(f"   Total de registros: {len(df):,}")
+        print(f"   Colunas: {', '.join(df.columns)}")
+        print(f"   Período: {df['DATA'].min()} a {df['DATA'].max()}")
+        print(f"   Agências: {sorted(df['AGENCIA'].unique())}")
+        
+        return df
+        
+    except Exception as e:
+        print(f"❌ Erro ao carregar arquivo: {e}")
+        raise
+
+# %%
+def prepare_drift_scenarios(df, agencia, pandemic_start='2020-03-01'):
+    """
+    Prepara cenários para análise de drift.
+    
+    Returns:
+        Dict com dados pré e pós pandemia
+    """
+    # Filtra agência
+    df_agencia = df[df['AGENCIA'] == agencia].copy()
+    df_agencia = df_agencia.sort_values('DATA')
+    
+    if len(df_agencia) == 0:
+        raise ValueError(f"Nenhum dado encontrado para agência {agencia}")
+    
+    # Define período pandêmico
+    pandemic_date = pd.to_datetime(pandemic_start)
+    
+    # Separa períodos
+    pre_pandemic = df_agencia[df_agencia['DATA'] < pandemic_date]
+    post_pandemic = df_agencia[df_agencia['DATA'] >= pandemic_date]
+    
+    print(f"\nAgência {agencia}:")
+    print(f"  Pré-pandemia: {len(pre_pandemic)} registros ({pre_pandemic['DATA'].min()} a {pre_pandemic['DATA'].max()})")
+    print(f"  Pós-pandemia: {len(post_pandemic)} registros ({post_pandemic['DATA'].min()} a {post_pandemic['DATA'].max()})")
+    
+    return {
+        'pre_pandemic': pre_pandemic,
+        'post_pandemic': post_pandemic,
+        'full_data': df_agencia,
+        'pandemic_date': pandemic_date,
+        'pandemic_index': len(pre_pandemic)
+    }
+
+# %%
+def run_complete_drift_analysis(data_dict, variable='SAQUE'):
+    """
+    Executa análise completa com todas as combinações de métodos.
+    """
+    full_data = data_dict['full_data']
+    pandemic_idx = data_dict['pandemic_index']
+    
+    # Verifica se há dados de previsão
+    if f'{variable}_PRED' in full_data.columns:
+        y_true = full_data[variable].values
+        y_pred = full_data[f'{variable}_PRED'].values
+    else:
+        # Se não houver previsões, cria previsões simuladas
+        print(f"⚠️ Coluna {variable}_PRED não encontrada. Usando valores reais deslocados como proxy.")
+        y_true = full_data[variable].values
+        # Usa valor do dia anterior como "previsão"
+        y_pred = np.roll(y_true, 1)
+        y_pred[0] = y_true[0]
+    
+    results = {}
+    
+    # Configurações de janela
+    janelas = [None, 30]  # None = todas observações anteriores, 30 = últimos 30 dias
+    
+    for janela in janelas:
+        janela_nome = 'todas' if janela is None else f'{janela}_dias'
+        print(f"\n📊 Analisando com janela: {janela_nome}")
+        
+        # 1. Erro Absoluto
+        print("  - Calculando p-valores (erro absoluto)...")
+        p_det_abs, p_rnd_abs = calcular_pvalores_erro_absoluto(y_true, y_pred, janela)
+        
+        # 2. Distância Mínima
+        print("  - Calculando p-valores (distância mínima)...")
+        p_det_min, p_rnd_min = calcular_pvalores_distancia(y_true, y_pred, 'min', janela)
+        
+        # 3. Distância Média
+        print("  - Calculando p-valores (distância média)...")
+        p_det_mean, p_rnd_mean = calcular_pvalores_distancia(y_true, y_pred, 'mean', janela)
+        
+        # Martingales para cada método
+        for nome, p_det, p_rnd in [
+            ('erro_absoluto', p_det_abs, p_rnd_abs),
+            ('dist_min', p_det_min, p_rnd_min),
+            ('dist_mean', p_det_mean, p_rnd_mean)
+        ]:
+            # Power Martingale - Cumprod
+            M_power_cumprod = power_martingale_cumprod(p_det)
+            
+            # Power Martingale - Incremental
+            M_power_incr = power_martingale_incremental(p_det)
+            
+            # Simple Jumper
+            M_jumper = simple_jumper_martingale(p_det)
+            
+            results[f'{janela_nome}_{nome}'] = {
+                'p_det': p_det,
+                'p_rnd': p_rnd,
+                'M_power_cumprod': M_power_cumprod,
+                'M_power_incremental': M_power_incr,
+                'M_jumper': M_jumper,
+                'pandemic_idx': pandemic_idx
+            }
+    
+    return results
+
+# %%
+def plot_comparison_results(results, variable='SAQUE'):
+    """
+    Plota comparação entre diferentes métodos.
+    """
+    # Figura 1: Comparação de métodos de p-valor
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'Comparação de Métodos de P-valor - {variable}', fontsize=16)
+    
+    methods = ['erro_absoluto', 'dist_min', 'dist_mean']
+    titles = ['Erro Absoluto', 'Distância Mínima', 'Distância Média']
+    
+    for row, janela in enumerate(['todas', '30_dias']):
+        for col, (method, title) in enumerate(zip(methods, titles)):
+            key = f'{janela}_{method}'
+            if key in results:
+                ax = axes[row, col]
+                data = results[key]
+                pandemic_idx = data['pandemic_idx']
+                
+                # Plota martingale
+                ax.plot(data['M_power_cumprod'], label='Power (cumprod)', linewidth=2)
+                ax.plot(data['M_power_incremental'], label='Power (incremental)', 
+                       linewidth=2, linestyle='--', alpha=0.8)
+                
+                # Marcadores
+                ax.axvline(pandemic_idx, color='red', linestyle='--', 
+                          alpha=0.7, label='Início Pandemia')
+                ax.axhline(20, color='orange', linestyle=':', 
+                          alpha=0.7, label='Threshold (1/α)')
+                
+                ax.set_yscale('log')
+                ax.set_xlabel('Tempo')
+                ax.set_ylabel('Martingale')
+                ax.set_title(f'{title} - Janela: {janela}')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Figura 2: P-valores ao longo do tempo
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'P-valores ao Longo do Tempo - {variable}', fontsize=16)
+    
+    for row, janela in enumerate(['todas', '30_dias']):
+        for col, (method, title) in enumerate(zip(methods, titles)):
+            key = f'{janela}_{method}'
+            if key in results:
+                ax = axes[row, col]
+                data = results[key]
+                pandemic_idx = data['pandemic_idx']
+                
+                # Plota p-valores
+                ax.plot(data['p_det'], alpha=0.7, label='Determinístico')
+                ax.plot(data['p_rnd'], alpha=0.7, label='Randomizado')
+                
+                # Marcadores
+                ax.axvline(pandemic_idx, color='red', linestyle='--', 
+                          alpha=0.7, label='Início Pandemia')
+                ax.axhline(0.05, color='orange', linestyle=':', 
+                          alpha=0.7, label='α = 0.05')
+                
+                ax.set_xlabel('Tempo')
+                ax.set_ylabel('P-valor')
+                ax.set_title(f'{title} - Janela: {janela}')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+# %%
+def analyze_detection_performance(results, variable='SAQUE'):
+    """
+    Analisa quando cada método detecta drift.
+    """
+    print(f"\n{'='*80}")
+    print(f"ANÁLISE DE DETECÇÃO DE DRIFT - {variable}")
+    print(f"{'='*80}")
+    
+    threshold = 20  # 1/0.05
+    
+    for key, data in results.items():
+        pandemic_idx = data['pandemic_idx']
+        
+        # Analisa detecção após pandemia
+        post_pandemic_martingale = data['M_power_cumprod'][pandemic_idx:]
+        
+        # Encontra primeira detecção
+        detection_idx = np.where(post_pandemic_martingale > threshold)[0]
+        
+        print(f"\n{key}:")
+        print(f"  Método: {' '.join(key.split('_'))}")
+        
+        if len(detection_idx) > 0:
+            days_to_detection = detection_idx[0]
+            print(f"  ✅ Drift detectado após {days_to_detection} dias da pandemia")
+            print(f"  Valor máximo do martingale: {np.max(post_pandemic_martingale):.2f}")
+        else:
+            print(f"  ❌ Drift NÃO detectado")
+            print(f"  Valor máximo do martingale: {np.max(post_pandemic_martingale):.2f}")
+        
+        # Analisa falsos positivos antes da pandemia
+        pre_pandemic_martingale = data['M_power_cumprod'][:pandemic_idx]
+        false_positives = np.sum(pre_pandemic_martingale > threshold)
+        
+        if false_positives > 0:
+            print(f"  ⚠️ {false_positives} falsos positivos antes da pandemia")
+
+# %% [markdown]
+# ## 5. Execução Principal
+
+# %%
+# Configurações
+FILE_PATH = 'NUMERARIO_PRE_POS_PANDEMIA.csv'  # Ajuste o caminho se necessário
+AGENCIA = 49  # Ajuste conforme suas agências disponíveis
+PANDEMIC_START = '2020-03-01'
+
+# %%
+# Carrega dados reais
+print("📂 Carregando dados do Numerários...")
+df = load_numerarios_data(FILE_PATH)
+
+# %%
+# Prepara cenários
+print(f"\n🔍 Preparando dados para análise...")
+data_dict = prepare_drift_scenarios(df, AGENCIA, PANDEMIC_START)
+
+# %%
+# Variáveis para análise
+variables = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']
+
+# Armazena todos os resultados
+all_results = {}
+
+# %%
+# Executa análise para cada variável
+for var in variables:
+    if var in df.columns:
+        print(f"\n{'='*80}")
+        print(f"ANALISANDO: {var}")
+        print(f"{'='*80}")
+        
+        results = run_complete_drift_analysis(data_dict, var)
+        all_results[var] = results
+        
+        # Plota resultados
+        plot_comparison_results(results, var)
+        
+        # Analisa performance
+        analyze_detection_performance(results, var)
+
+# %% [markdown]
+# ## 6. Resumo Comparativo
+
+# %%
+def create_summary_table(all_results):
+    """
+    Cria tabela resumo com performance de cada método.
+    """
+    summary = []
+    threshold = 20
+    
+    for var, var_results in all_results.items():
+        for method_key, data in var_results.items():
+            pandemic_idx = data['pandemic_idx']
+            
+            # Detecção pós-pandemia
+            post_martingale = data['M_power_cumprod'][pandemic_idx:]
+            detection_idx = np.where(post_martingale > threshold)[0]
+            
+            # Falsos positivos pré-pandemia
+            pre_martingale = data['M_power_cumprod'][:pandemic_idx]
+            false_positives = np.sum(pre_martingale > threshold)
+            
+            row = {
+                'Variável': var,
+                'Método': method_key,
+                'Drift Detectado': 'Sim' if len(detection_idx) > 0 else 'Não',
+                'Dias até Detecção': detection_idx[0] if len(detection_idx) > 0 else None,
+                'Falsos Positivos': false_positives,
+                'Max Martingale': np.max(data['M_power_cumprod'])
+            }
+            summary.append(row)
+    
+    return pd.DataFrame(summary)
+
+# %%
+# Cria e exibe tabela resumo
+summary_df = create_summary_table(all_results)
+print("\n📊 RESUMO DA DETECÇÃO DE DRIFT")
+print("="*80)
+print(summary_df.to_string(index=False))
+
+# %%
+# Salva resultados
+output_file = f'drift_analysis_agencia_{AGENCIA}.csv'
+summary_df.to_csv(output_file, index=False)
+print(f"\n💾 Resultados salvos em: {output_file}")
+
+# %% [markdown]
+# ## 7. Recomendações
+
+# %%
+print("\n" + "="*80)
+print("RECOMENDAÇÕES BASEADAS NA ANÁLISE")
+print("="*80)
+
+print("""
+1. JANELA TEMPORAL:
+   - Para Numerários, usar janela de 30 dias parece mais apropriado
+   - Reduz ruído e falsos positivos
+   - Captura padrões sazonais mensais (pagamentos, etc.)
+
+2. MÉTODO DE NÃO-CONFORMIDADE:
+   - Erro absoluto: Mais direto e interpretável
+   - Distância mínima: Pode ser muito sensível a outliers
+   - Distância média: Mais robusto, mas pode demorar para detectar
+
+3. IMPLEMENTAÇÃO MARTINGALE:
+   - Cumprod vs Incremental produzem resultados idênticos
+   - Cumprod é mais eficiente computacionalmente
+   - Use incremental apenas se precisar de atualizações online
+
+4. THRESHOLD:
+   - Padrão 1/α = 20 pode ser ajustado
+   - Considere diferentes thresholds por variável
+   - CEI pode precisar de threshold diferente
+
+5. INTEGRAÇÃO MLOPS:
+   - Implemente monitoramento contínuo
+   - Configure alertas baseados nos resultados
+   - Considere retreino automático quando drift detectado
+""")
