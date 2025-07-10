@@ -1,0 +1,823 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+"""
+# Detecção de Drift em Previsões de Numerários usando Métodos Conformais
+## Baseado no artigo: "A Simple Method for Detecting Drift in Machine Learning Models" (https://arxiv.org/abs/2102.10439)
+
+Este notebook implementa a detecção de drift usando o método Martingale para avaliar as previsões 
+do modelo Numerários, comparando períodos pré e pós-pandemia.
+"""
+
+# %% [markdown]
+# ## 1. Importação de Bibliotecas e Configuração Inicial
+
+# %%
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+from typing import Tuple, List, Dict, Optional
+from scipy import stats
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
+warnings.filterwarnings('ignore')
+
+# Configuração de visualização
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+
+# %% [markdown]
+# ## 2. Implementação dos Métodos Conformais
+
+# %%
+class ConformalDriftDetector:
+    """
+    Implementa detecção de drift usando métodos conformais baseados em Martingale.
+    Referência: Vovk et al. (2021) - https://arxiv.org/abs/2102.10439
+    """
+    
+    def __init__(self, significance_level: float = 0.05, method: str = 'power'):
+        """
+        Inicializa o detector de drift conformal.
+        
+        Args:
+            significance_level: Nível de significância para detecção de drift (alpha)
+            method: Método de martingale ('power' ou 'simple')
+        """
+        self.significance_level = significance_level
+        self.method = method
+        self.reset()
+        
+    def reset(self):
+        """Reseta o estado do detector."""
+        self.martingale_values = []
+        self.p_values = []
+        self.threshold = 1 / self.significance_level
+        
+    def compute_nonconformity_score(self, y_true: float, y_pred: float, 
+                                   calibration_scores: np.ndarray) -> float:
+        """
+        Calcula o score de não-conformidade baseado no erro absoluto.
+        
+        Args:
+            y_true: Valor real
+            y_pred: Valor predito
+            calibration_scores: Scores de calibração do período de referência
+            
+        Returns:
+            Score de não-conformidade normalizado
+        """
+        # Score de não-conformidade = erro absoluto
+        score = np.abs(y_true - y_pred)
+        
+        # Normalização usando MAD (Median Absolute Deviation) para robustez
+        mad = np.median(np.abs(calibration_scores - np.median(calibration_scores)))
+        if mad > 0:
+            score = score / (1.4826 * mad)  # 1.4826 é o fator de consistência para distribuição normal
+            
+        return score
+    
+    def compute_p_value(self, score: float, calibration_scores: np.ndarray) -> float:
+        """
+        Calcula o p-valor conformal.
+        
+        Args:
+            score: Score de não-conformidade atual
+            calibration_scores: Scores de calibração
+            
+        Returns:
+            p-valor conformal
+        """
+        # P-valor = proporção de scores de calibração maiores ou iguais ao score atual
+        p_value = np.mean(calibration_scores >= score)
+        
+        # Evita p-valores exatamente 0 ou 1
+        p_value = np.clip(p_value, 1e-6, 1 - 1e-6)
+        
+        return p_value
+    
+    def update_martingale(self, p_value: float) -> float:
+        """
+        Atualiza o valor do martingale.
+        
+        Args:
+            p_value: p-valor atual
+            
+        Returns:
+            Valor atualizado do martingale
+        """
+        if self.method == 'power':
+            # Power martingale com epsilon ótimo
+            epsilon = self.significance_level
+            betting_function = epsilon * p_value**(epsilon - 1)
+        else:
+            # Simple martingale
+            betting_function = 1 / p_value if p_value < self.significance_level else 0
+            
+        # Atualiza martingale
+        if len(self.martingale_values) == 0:
+            martingale = betting_function
+        else:
+            martingale = self.martingale_values[-1] * betting_function
+            
+        return martingale
+    
+    def detect_drift(self, y_true: np.ndarray, y_pred: np.ndarray, 
+                    calibration_true: np.ndarray, calibration_pred: np.ndarray) -> Dict:
+        """
+        Detecta drift nas previsões usando método conformal.
+        
+        Args:
+            y_true: Valores reais do período de teste
+            y_pred: Valores preditos do período de teste
+            calibration_true: Valores reais do período de calibração (pré-pandemia)
+            calibration_pred: Valores preditos do período de calibração
+            
+        Returns:
+            Dicionário com resultados da detecção
+        """
+        self.reset()
+        
+        # Calcula scores de não-conformidade para calibração
+        calibration_scores = np.abs(calibration_true - calibration_pred)
+        
+        # Processa cada observação sequencialmente
+        drift_detected = False
+        drift_time = None
+        
+        for t, (yt, yp) in enumerate(zip(y_true, y_pred)):
+            # Calcula score de não-conformidade
+            score = self.compute_nonconformity_score(yt, yp, calibration_scores)
+            
+            # Calcula p-valor
+            p_value = self.compute_p_value(score, calibration_scores)
+            self.p_values.append(p_value)
+            
+            # Atualiza martingale
+            martingale = self.update_martingale(p_value)
+            self.martingale_values.append(martingale)
+            
+            # Verifica detecção de drift
+            if martingale > self.threshold and not drift_detected:
+                drift_detected = True
+                drift_time = t
+                
+        return {
+            'drift_detected': drift_detected,
+            'drift_time': drift_time,
+            'martingale_values': np.array(self.martingale_values),
+            'p_values': np.array(self.p_values),
+            'threshold': self.threshold
+        }
+
+# %% [markdown]
+# ## 3. Funções de Análise e Visualização
+
+# %%
+def analyze_drift_by_variable(df: pd.DataFrame, agencia: int, 
+                             pandemic_start: str = '2020-03-01',
+                             calibration_months: int = 12) -> Dict:
+    """
+    Analisa drift para cada variável de uma agência específica.
+    
+    Args:
+        df: DataFrame com as previsões
+        agencia: Número da agência
+        pandemic_start: Data de início da pandemia
+        calibration_months: Meses de dados pré-pandemia para calibração
+        
+    Returns:
+        Dicionário com resultados por variável
+    """
+    # Filtra dados da agência
+    df_agencia = df[df['AGENCIA'] == agencia].copy()
+    df_agencia['DATA'] = pd.to_datetime(df_agencia['DATA'])
+    df_agencia = df_agencia.sort_values('DATA')
+    
+    # Define períodos
+    pandemic_date = pd.to_datetime(pandemic_start)
+    calibration_start = pandemic_date - pd.DateOffset(months=calibration_months)
+    
+    # Separa períodos
+    mask_calibration = (df_agencia['DATA'] >= calibration_start) & (df_agencia['DATA'] < pandemic_date)
+    mask_test = df_agencia['DATA'] >= pandemic_date
+    
+    df_calibration = df_agencia[mask_calibration]
+    df_test = df_agencia[mask_test]
+    
+    # Variáveis para análise
+    variables = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']
+    results = {}
+    
+    # Detector conformal
+    detector = ConformalDriftDetector(significance_level=0.05, method='power')
+    
+    for var in variables:
+        if var in df_calibration.columns and var in df_test.columns:
+            # Valores de calibração e teste
+            cal_true = df_calibration[var].values
+            cal_pred = df_calibration[f'{var}_PRED'].values if f'{var}_PRED' in df_calibration.columns else cal_true
+            
+            test_true = df_test[var].values
+            test_pred = df_test[f'{var}_PRED'].values if f'{var}_PRED' in df_test.columns else test_true
+            
+            # Detecta drift
+            drift_results = detector.detect_drift(test_true, test_pred, cal_true, cal_pred)
+            
+            # Adiciona informações extras
+            drift_results['variable'] = var
+            drift_results['test_dates'] = df_test['DATA'].values
+            drift_results['mae_calibration'] = mean_absolute_error(cal_true, cal_pred)
+            drift_results['mae_test'] = mean_absolute_error(test_true, test_pred)
+            drift_results['performance_degradation'] = (
+                (drift_results['mae_test'] - drift_results['mae_calibration']) / 
+                drift_results['mae_calibration'] * 100
+            )
+            
+            results[var] = drift_results
+            
+    return results
+
+# %%
+def plot_drift_detection_results(results: Dict, agencia: int):
+    """
+    Visualiza os resultados da detecção de drift.
+    
+    Args:
+        results: Resultados da análise de drift
+        agencia: Número da agência
+    """
+    # Cria subplots para cada variável
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[var for var in results.keys()],
+        vertical_spacing=0.12,
+        horizontal_spacing=0.1
+    )
+    
+    positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
+    
+    for idx, (var, res) in enumerate(results.items()):
+        row, col = positions[idx]
+        
+        # Plot martingale values
+        fig.add_trace(
+            go.Scatter(
+                x=res['test_dates'],
+                y=res['martingale_values'],
+                mode='lines',
+                name=f'Martingale {var}',
+                line=dict(width=2)
+            ),
+            row=row, col=col
+        )
+        
+        # Linha de threshold
+        fig.add_trace(
+            go.Scatter(
+                x=res['test_dates'],
+                y=[res['threshold']] * len(res['test_dates']),
+                mode='lines',
+                name='Threshold',
+                line=dict(color='red', dash='dash'),
+                showlegend=(idx == 0)
+            ),
+            row=row, col=col
+        )
+        
+        # Marca ponto de detecção de drift
+        if res['drift_detected']:
+            drift_date = res['test_dates'][res['drift_time']]
+            drift_value = res['martingale_values'][res['drift_time']]
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=[drift_date],
+                    y=[drift_value],
+                    mode='markers',
+                    name='Drift detectado',
+                    marker=dict(size=10, color='red', symbol='x'),
+                    showlegend=(idx == 0)
+                ),
+                row=row, col=col
+            )
+            
+        # Atualiza eixos
+        fig.update_xaxes(title_text="Data", row=row, col=col)
+        fig.update_yaxes(title_text="Martingale", type="log", row=row, col=col)
+        
+    fig.update_layout(
+        title=f"Detecção de Drift Conformal - Agência {agencia}",
+        height=800,
+        showlegend=True,
+        template='plotly_white'
+    )
+    
+    fig.show()
+    
+    # Tabela resumo
+    print(f"\n{'='*80}")
+    print(f"RESUMO DA DETECÇÃO DE DRIFT - AGÊNCIA {agencia}")
+    print(f"{'='*80}")
+    print(f"{'Variável':<15} {'Drift?':<10} {'Dia Detecção':<15} {'MAE Pré':<12} {'MAE Pós':<12} {'Degradação':<15}")
+    print(f"{'-'*80}")
+    
+    for var, res in results.items():
+        drift_day = res['drift_time'] + 1 if res['drift_detected'] else '-'
+        degradation = f"{res['performance_degradation']:.1f}%" if res['drift_detected'] else '-'
+        
+        print(f"{var:<15} {'Sim' if res['drift_detected'] else 'Não':<10} "
+              f"{str(drift_day):<15} {res['mae_calibration']:<12.2f} "
+              f"{res['mae_test']:<12.2f} {degradation:<15}")
+
+# %%
+def plot_p_values_distribution(results: Dict, agencia: int):
+    """
+    Visualiza a distribuição dos p-valores ao longo do tempo.
+    
+    Args:
+        results: Resultados da análise de drift
+        agencia: Número da agência
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    axes = axes.ravel()
+    
+    for idx, (var, res) in enumerate(results.items()):
+        ax = axes[idx]
+        
+        # Plot p-valores
+        dates = res['test_dates']
+        p_values = res['p_values']
+        
+        ax.plot(dates, p_values, label='p-valores', alpha=0.7)
+        ax.axhline(y=0.05, color='r', linestyle='--', label='α = 0.05')
+        ax.fill_between(dates, 0, p_values, where=(p_values < 0.05), 
+                       color='red', alpha=0.3, label='Região crítica')
+        
+        ax.set_title(f'{var}')
+        ax.set_xlabel('Data')
+        ax.set_ylabel('p-valor')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Rotaciona labels do eixo x
+        ax.tick_params(axis='x', rotation=45)
+        
+    plt.suptitle(f'Distribuição de p-valores Conformais - Agência {agencia}', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+# %% [markdown]
+# ## 4. Análise Multivariada de Drift
+
+# %%
+class MultivariateDriftDetector:
+    """
+    Detecta drift considerando múltiplas variáveis simultaneamente.
+    """
+    
+    def __init__(self, significance_level: float = 0.05):
+        self.significance_level = significance_level
+        self.detectors = {}
+        
+    def detect_multivariate_drift(self, df_test: pd.DataFrame, df_calibration: pd.DataFrame,
+                                 variables: List[str]) -> Dict:
+        """
+        Detecta drift multivariado usando agregação de p-valores.
+        
+        Args:
+            df_test: Dados de teste (pós-pandemia)
+            df_calibration: Dados de calibração (pré-pandemia)
+            variables: Lista de variáveis para análise
+            
+        Returns:
+            Resultados da detecção multivariada
+        """
+        # Inicializa detectores para cada variável
+        for var in variables:
+            self.detectors[var] = ConformalDriftDetector(self.significance_level)
+            
+        # Coleta p-valores de todas as variáveis
+        all_p_values = []
+        
+        for var in variables:
+            if var in df_test.columns and var in df_calibration.columns:
+                cal_true = df_calibration[var].values
+                cal_pred = df_calibration[f'{var}_PRED'].values if f'{var}_PRED' in df_calibration.columns else cal_true
+                
+                test_true = df_test[var].values
+                test_pred = df_test[f'{var}_PRED'].values if f'{var}_PRED' in df_test.columns else test_true
+                
+                # Detecta drift
+                results = self.detectors[var].detect_drift(test_true, test_pred, cal_true, cal_pred)
+                all_p_values.append(results['p_values'])
+                
+        # Combina p-valores usando método de Fisher
+        all_p_values = np.array(all_p_values)
+        combined_p_values = []
+        
+        for t in range(all_p_values.shape[1]):
+            p_vals = all_p_values[:, t]
+            # Método de Fisher para combinar p-valores
+            chi2_stat = -2 * np.sum(np.log(p_vals))
+            combined_p = 1 - stats.chi2.cdf(chi2_stat, df=2*len(p_vals))
+            combined_p_values.append(combined_p)
+            
+        # Calcula martingale combinado
+        combined_detector = ConformalDriftDetector(self.significance_level)
+        combined_martingale = []
+        
+        for p in combined_p_values:
+            mart = combined_detector.update_martingale(p)
+            combined_martingale.append(mart)
+            combined_detector.martingale_values.append(mart)
+            
+        # Detecta drift multivariado
+        drift_detected = False
+        drift_time = None
+        
+        for t, mart in enumerate(combined_martingale):
+            if mart > combined_detector.threshold:
+                drift_detected = True
+                drift_time = t
+                break
+                
+        return {
+            'drift_detected': drift_detected,
+            'drift_time': drift_time,
+            'combined_p_values': np.array(combined_p_values),
+            'combined_martingale': np.array(combined_martingale),
+            'individual_detectors': self.detectors,
+            'threshold': combined_detector.threshold
+        }
+
+# %% [markdown]
+# ## 5. Carregamento e Análise dos Dados
+
+# %%
+def load_and_prepare_data(filepath: str) -> pd.DataFrame:
+    """
+    Carrega e prepara os dados do CSV.
+    
+    Args:
+        filepath: Caminho para o arquivo CSV
+        
+    Returns:
+        DataFrame preparado
+    """
+    # Carrega dados
+    df = pd.read_csv(filepath)
+    
+    # Converte datas
+    date_columns = ['DATA', 'DATA_REFERENCIA', 'DATA_PREVISAO']
+    for col in date_columns:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col])
+            
+    # Ordena por agência e data
+    df = df.sort_values(['AGENCIA', 'DATA'])
+    
+    # Remove valores negativos (se houver)
+    value_columns = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']
+    for col in value_columns:
+        if col in df.columns:
+            df[col] = df[col].clip(lower=0)
+            
+    return df
+
+# %%
+def generate_synthetic_predictions(df: pd.DataFrame, noise_level: float = 0.1) -> pd.DataFrame:
+    """
+    Gera previsões sintéticas para demonstração (caso não existam no CSV).
+    
+    Args:
+        df: DataFrame com dados reais
+        noise_level: Nível de ruído para adicionar às previsões
+        
+    Returns:
+        DataFrame com colunas de previsão adicionadas
+    """
+    df = df.copy()
+    
+    variables = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']
+    
+    for var in variables:
+        if var in df.columns and f'{var}_PRED' not in df.columns:
+            # Simula previsões com ruído crescente pós-pandemia
+            pandemic_date = pd.to_datetime('2020-03-01')
+            
+            # Máscara para período pós-pandemia
+            post_pandemic = df['DATA'] >= pandemic_date
+            
+            # Gera previsões
+            noise = np.random.normal(0, noise_level, len(df))
+            df[f'{var}_PRED'] = df[var] * (1 + noise)
+            
+            # Adiciona drift no período pós-pandemia
+            drift_factor = np.where(post_pandemic, 
+                                   1 + 0.2 * np.random.random(len(df)),  # Drift de até 20%
+                                   1)
+            df.loc[post_pandemic, f'{var}_PRED'] *= drift_factor[post_pandemic]
+            
+    return df
+
+# %% [markdown]
+# ## 6. Execução da Análise Principal
+
+# %%
+# Configurações principais
+FILE_PATH = 'previsoes_numerarios.csv'  # Altere para o caminho do seu arquivo
+AGENCIA_TESTE = 1001  # Altere para o número da agência desejada
+PANDEMIC_START = '2020-03-01'
+CALIBRATION_MONTHS = 12
+
+# %%
+# Exemplo de uso com dados sintéticos (remova esta célula quando usar dados reais)
+# Gerando dados de exemplo para demonstração
+np.random.seed(42)
+dates = pd.date_range('2019-01-01', '2021-12-31', freq='D')
+n_agencies = 3
+agencies = [1001, 1002, 1003]
+
+# Cria DataFrame sintético
+data = []
+for agency in agencies:
+    for date in dates:
+        row = {
+            'DATA': date,
+            'AGENCIA': agency,
+            'SAQUE': np.random.poisson(10000 + agency * 100),
+            'SAQUE_CEI': np.random.poisson(5000 + agency * 50),
+            'DEPOSITO': np.random.poisson(8000 + agency * 80),
+            'DEP_CEI': np.random.poisson(3000 + agency * 30),
+            'DATA_REFERENCIA': date - timedelta(days=1),
+            'DATA_PREVISAO': date
+        }
+        data.append(row)
+
+df = pd.DataFrame(data)
+df = generate_synthetic_predictions(df, noise_level=0.1)
+
+# %%
+# Para usar com dados reais, descomente as linhas abaixo:
+# df = load_and_prepare_data(FILE_PATH)
+# Se as previsões não estiverem no CSV, gere previsões sintéticas:
+# df = generate_synthetic_predictions(df)
+
+# %%
+# Análise de drift para uma agência específica
+print(f"Analisando drift para Agência {AGENCIA_TESTE}")
+print(f"Período de calibração: {CALIBRATION_MONTHS} meses antes da pandemia")
+print(f"Data de início da pandemia: {PANDEMIC_START}\n")
+
+results = analyze_drift_by_variable(df, AGENCIA_TESTE, PANDEMIC_START, CALIBRATION_MONTHS)
+
+# %%
+# Visualização dos resultados
+plot_drift_detection_results(results, AGENCIA_TESTE)
+
+# %%
+# Visualização da distribuição de p-valores
+plot_p_values_distribution(results, AGENCIA_TESTE)
+
+# %% [markdown]
+# ## 7. Análise Multivariada
+
+# %%
+# Prepara dados para análise multivariada
+df_agencia = df[df['AGENCIA'] == AGENCIA_TESTE].copy()
+df_agencia = df_agencia.sort_values('DATA')
+
+pandemic_date = pd.to_datetime(PANDEMIC_START)
+calibration_start = pandemic_date - pd.DateOffset(months=CALIBRATION_MONTHS)
+
+mask_calibration = (df_agencia['DATA'] >= calibration_start) & (df_agencia['DATA'] < pandemic_date)
+mask_test = df_agencia['DATA'] >= pandemic_date
+
+df_calibration = df_agencia[mask_calibration]
+df_test = df_agencia[mask_test]
+
+# %%
+# Detecta drift multivariado
+multivariate_detector = MultivariateDriftDetector(significance_level=0.05)
+variables = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']
+
+mv_results = multivariate_detector.detect_multivariate_drift(
+    df_test, df_calibration, variables
+)
+
+# %%
+# Visualiza resultados multivariados
+fig = go.Figure()
+
+# Martingale combinado
+fig.add_trace(go.Scatter(
+    x=df_test['DATA'],
+    y=mv_results['combined_martingale'],
+    mode='lines',
+    name='Martingale Multivariado',
+    line=dict(width=3, color='blue')
+))
+
+# Threshold
+fig.add_trace(go.Scatter(
+    x=df_test['DATA'],
+    y=[mv_results['threshold']] * len(df_test),
+    mode='lines',
+    name='Threshold',
+    line=dict(color='red', dash='dash', width=2)
+))
+
+# Ponto de detecção
+if mv_results['drift_detected']:
+    drift_date = df_test['DATA'].iloc[mv_results['drift_time']]
+    drift_value = mv_results['combined_martingale'][mv_results['drift_time']]
+    
+    fig.add_trace(go.Scatter(
+        x=[drift_date],
+        y=[drift_value],
+        mode='markers',
+        name='Drift Multivariado Detectado',
+        marker=dict(size=15, color='red', symbol='star')
+    ))
+
+fig.update_layout(
+    title=f"Detecção de Drift Multivariado - Agência {AGENCIA_TESTE}",
+    xaxis_title="Data",
+    yaxis_title="Martingale Combinado",
+    yaxis_type="log",
+    template='plotly_white',
+    height=500
+)
+
+fig.show()
+
+# %%
+# Resumo final
+print(f"\n{'='*80}")
+print(f"RESUMO DA ANÁLISE DE DRIFT")
+print(f"{'='*80}")
+print(f"\nAgência: {AGENCIA_TESTE}")
+print(f"Período analisado: {df_test['DATA'].min().strftime('%Y-%m-%d')} a {df_test['DATA'].max().strftime('%Y-%m-%d')}")
+print(f"Total de dias analisados: {len(df_test)}")
+
+print(f"\n{'Análise Univariada:'}")
+for var, res in results.items():
+    if res['drift_detected']:
+        drift_date = df_test['DATA'].iloc[res['drift_time']]
+        print(f"  {var}: Drift detectado em {drift_date.strftime('%Y-%m-%d')} (dia {res['drift_time']+1})")
+    else:
+        print(f"  {var}: Sem drift detectado")
+
+print(f"\n{'Análise Multivariada:'}")
+if mv_results['drift_detected']:
+    drift_date = df_test['DATA'].iloc[mv_results['drift_time']]
+    print(f"  Drift multivariado detectado em {drift_date.strftime('%Y-%m-%d')} (dia {mv_results['drift_time']+1})")
+else:
+    print(f"  Sem drift multivariado detectado")
+
+# %% [markdown]
+# ## 8. Análise de Sensibilidade e Métricas Adicionais
+
+# %%
+def sensitivity_analysis(df: pd.DataFrame, agencia: int, 
+                        significance_levels: List[float] = [0.01, 0.05, 0.1],
+                        methods: List[str] = ['power', 'simple']) -> pd.DataFrame:
+    """
+    Realiza análise de sensibilidade variando parâmetros do detector.
+    
+    Args:
+        df: DataFrame com os dados
+        agencia: Número da agência
+        significance_levels: Níveis de significância para testar
+        methods: Métodos de martingale para testar
+        
+    Returns:
+        DataFrame com resultados da análise
+    """
+    results = []
+    
+    # Prepara dados
+    df_agencia = df[df['AGENCIA'] == agencia].copy()
+    df_agencia = df_agencia.sort_values('DATA')
+    
+    pandemic_date = pd.to_datetime(PANDEMIC_START)
+    calibration_start = pandemic_date - pd.DateOffset(months=CALIBRATION_MONTHS)
+    
+    mask_calibration = (df_agencia['DATA'] >= calibration_start) & (df_agencia['DATA'] < pandemic_date)
+    mask_test = df_agencia['DATA'] >= pandemic_date
+    
+    df_calibration = df_agencia[mask_calibration]
+    df_test = df_agencia[mask_test]
+    
+    variables = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']
+    
+    # Testa diferentes configurações
+    for alpha in significance_levels:
+        for method in methods:
+            for var in variables:
+                if var in df_calibration.columns:
+                    detector = ConformalDriftDetector(significance_level=alpha, method=method)
+                    
+                    cal_true = df_calibration[var].values
+                    cal_pred = df_calibration[f'{var}_PRED'].values if f'{var}_PRED' in df_calibration.columns else cal_true
+                    
+                    test_true = df_test[var].values
+                    test_pred = df_test[f'{var}_PRED'].values if f'{var}_PRED' in df_test.columns else test_true
+                    
+                    drift_res = detector.detect_drift(test_true, test_pred, cal_true, cal_pred)
+                    
+                    results.append({
+                        'variable': var,
+                        'alpha': alpha,
+                        'method': method,
+                        'drift_detected': drift_res['drift_detected'],
+                        'drift_time': drift_res['drift_time'] if drift_res['drift_detected'] else None,
+                        'max_martingale': np.max(drift_res['martingale_values'])
+                    })
+                    
+    return pd.DataFrame(results)
+
+# %%
+# Executa análise de sensibilidade
+sensitivity_df = sensitivity_analysis(df, AGENCIA_TESTE)
+
+# Visualiza resultados
+pivot_table = sensitivity_df.pivot_table(
+    values='drift_detected',
+    index=['variable', 'method'],
+    columns='alpha',
+    aggfunc='first'
+)
+
+print("\nAnálise de Sensibilidade - Detecção de Drift por Parâmetros")
+print("=" * 60)
+print(pivot_table)
+
+# %% [markdown]
+# ## 9. Exportação de Resultados
+
+# %%
+def export_results(results: Dict, agencia: int, output_path: str = None):
+    """
+    Exporta resultados da análise para arquivo CSV.
+    
+    Args:
+        results: Resultados da análise
+        agencia: Número da agência
+        output_path: Caminho para salvar o arquivo
+    """
+    if output_path is None:
+        output_path = f'drift_analysis_agencia_{agencia}.csv'
+        
+    # Prepara dados para exportação
+    export_data = []
+    
+    for var, res in results.items():
+        export_data.append({
+            'agencia': agencia,
+            'variavel': var,
+            'drift_detectado': res['drift_detected'],
+            'dia_deteccao': res['drift_time'] + 1 if res['drift_detected'] else None,
+            'mae_calibracao': res['mae_calibration'],
+            'mae_teste': res['mae_test'],
+            'degradacao_performance_%': res['performance_degradation'],
+            'max_martingale': np.max(res['martingale_values']),
+            'min_p_value': np.min(res['p_values'])
+        })
+        
+    df_export = pd.DataFrame(export_data)
+    df_export.to_csv(output_path, index=False)
+    print(f"\nResultados exportados para: {output_path}")
+    
+    return df_export
+
+# %%
+# Exporta resultados
+df_results = export_results(results, AGENCIA_TESTE)
+print("\nPrimeiras linhas dos resultados exportados:")
+print(df_results)
+
+# %% [markdown]
+# ## 10. Conclusões e Próximos Passos
+# 
+# ### Interpretação dos Resultados:
+# 
+# 1. **Detecção de Drift Individual**: Cada variável é analisada separadamente usando o método conformal
+# 2. **Detecção Multivariada**: Combina evidências de todas as variáveis para uma detecção mais robusta
+# 3. **Martingale Values**: Valores acima do threshold indicam forte evidência de drift
+# 4. **P-valores**: Valores consistentemente baixos indicam mudança na distribuição
+# 
+# ### Próximos Passos:
+# 
+# 1. **Análise de Múltiplas Agências**: Expandir para analisar todas as agências
+# 2. **Identificação de Padrões**: Agrupar agências com comportamentos similares de drift
+# 3. **Retreino Automático**: Implementar pipeline de retreino quando drift é detectado
+# 4. **Monitoramento Contínuo**: Integrar com o framework Auto MLOps
+# 5. **Análise de Causas**: Investigar fatores que contribuem para o drift detectado
