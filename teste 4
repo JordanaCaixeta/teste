@@ -1,0 +1,794 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Framework AutoMLOps - Detecção de Drift para Modelo Numerários
+Implementação do método conformal com martingales e comparação com métodos clássicos
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configurações de visualização
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+
+# =============================================================================
+# 1. CARREGAMENTO E PREPARAÇÃO DOS DADOS
+# =============================================================================
+
+def carregar_dados_numerarios(filepath):
+    """
+    Carrega os dados de previsões do modelo Numerários
+    """
+    df = pd.read_csv(filepath)
+    
+    # Converter datas
+    df['DATA'] = pd.to_datetime(df['DATA'])
+    df['DATA_REFERENCIA'] = pd.to_datetime(df['DATA_REFERENCIA'])
+    df['DATA_PREVISAO'] = pd.to_datetime(df['DATA_PREVISAO'])
+    
+    # Ordenar por data
+    df = df.sort_values(['AGENCIA', 'DATA'])
+    
+    return df
+
+def preparar_dados_agencia(df, agencia_id):
+    """
+    Filtra dados para uma agência específica
+    """
+    df_agencia = df[df['AGENCIA'] == agencia_id].copy()
+    df_agencia = df_agencia.sort_values('DATA')
+    df_agencia.reset_index(drop=True, inplace=True)
+    
+    return df_agencia
+
+# =============================================================================
+# 2. IMPLEMENTAÇÃO DO MÉTODO CONFORMAL
+# =============================================================================
+
+class ConformalDriftDetector:
+    """
+    Detector de drift baseado em método conformal com martingales
+    """
+    
+    def __init__(self, alpha=0.05, epsilon=0.92, janela_calibracao=30):
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.janela_calibracao = janela_calibracao
+        self.threshold = 1 / alpha
+        
+    def calcular_score_nao_conformidade(self, valores_historicos, valor_novo, metodo='erro_medio'):
+        """
+        Calcula o score de não-conformidade
+        
+        Métodos disponíveis:
+        - 'erro_medio': distância da média
+        - 'mahalanobis': distância de Mahalanobis
+        - 'densidade': baseado em densidade estimada
+        """
+        if len(valores_historicos) < 2:
+            return 0
+            
+        if metodo == 'erro_medio':
+            media = np.mean(valores_historicos)
+            std = np.std(valores_historicos) + 1e-8
+            score = np.abs(valor_novo - media) / std
+            
+        elif metodo == 'mahalanobis':
+            if len(valores_historicos.shape) == 1:
+                valores_historicos = valores_historicos.reshape(-1, 1)
+                valor_novo = np.array([valor_novo]).reshape(-1, 1)
+            
+            media = np.mean(valores_historicos, axis=0)
+            cov = np.cov(valores_historicos.T) + np.eye(valores_historicos.shape[1]) * 1e-8
+            diff = valor_novo.flatten() - media
+            score = np.sqrt(diff @ np.linalg.inv(cov) @ diff)
+            
+        elif metodo == 'densidade':
+            kde = stats.gaussian_kde(valores_historicos.T)
+            densidade = kde(valor_novo)[0]
+            score = -np.log(densidade + 1e-8)
+            
+        return score
+    
+    def calcular_pvalor_conformal(self, scores_historicos, score_novo):
+        """
+        Calcula o p-valor conformal
+        """
+        n = len(scores_historicos)
+        if n == 0:
+            return 1.0
+            
+        # Proporção de scores históricos >= score novo
+        p_valor = np.sum(scores_historicos >= score_novo) / (n + 1)
+        
+        # Versão randomizada para empates
+        empates = np.sum(np.abs(scores_historicos - score_novo) < 1e-8)
+        if empates > 0:
+            u = np.random.uniform()
+            maiores = np.sum(scores_historicos > score_novo)
+            p_valor = (maiores + u * empates) / (n + 1)
+            
+        return max(p_valor, 1e-8)  # Evitar p-valor zero
+    
+    def power_martingale(self, p_valores):
+        """
+        Calcula o Power Martingale
+        """
+        martingale = np.zeros(len(p_valores))
+        martingale[0] = self.epsilon * p_valores[0] ** (self.epsilon - 1)
+        
+        for t in range(1, len(p_valores)):
+            martingale[t] = martingale[t-1] * self.epsilon * p_valores[t] ** (self.epsilon - 1)
+            
+        return martingale
+    
+    def simple_jumper_martingale(self, p_valores, J=0.01):
+        """
+        Calcula o Simple Jumper Martingale
+        """
+        n = len(p_valores)
+        martingale = np.zeros(n)
+        
+        # Capital inicial para cada estratégia
+        C = {-1: 1/3, 0: 1/3, 1: 1/3}
+        
+        for t in range(n):
+            # Transição de Markov
+            C_new = {}
+            total = sum(C.values())
+            
+            for eps in [-1, 0, 1]:
+                C_new[eps] = (1 - J) * C[eps] + J * total / 3
+            
+            # Update com função de aposta
+            p = p_valores[t]
+            for eps in [-1, 0, 1]:
+                f_eps = 1 + eps * (p - 0.5)
+                C_new[eps] *= f_eps
+            
+            # Martingale total
+            martingale[t] = sum(C_new.values())
+            C = C_new
+            
+        return martingale
+    
+    def detectar_drift_univariado(self, serie_temporal, tipo_martingale='power'):
+        """
+        Detecta drift em uma série temporal univariada
+        """
+        n = len(serie_temporal)
+        scores = np.zeros(n)
+        p_valores = np.zeros(n)
+        
+        # Calcular scores e p-valores
+        for t in range(n):
+            if t < self.janela_calibracao:
+                scores[t] = 0
+                p_valores[t] = 1.0
+            else:
+                historico = serie_temporal[max(0, t-self.janela_calibracao):t]
+                scores[t] = self.calcular_score_nao_conformidade(historico, serie_temporal[t])
+                
+                scores_hist = scores[max(0, t-self.janela_calibracao):t]
+                p_valores[t] = self.calcular_pvalor_conformal(scores_hist, scores[t])
+        
+        # Calcular martingale
+        if tipo_martingale == 'power':
+            martingale = self.power_martingale(p_valores)
+        else:
+            martingale = self.simple_jumper_martingale(p_valores)
+        
+        # Detectar quando martingale ultrapassa threshold
+        deteccoes = martingale > self.threshold
+        
+        return {
+            'scores': scores,
+            'p_valores': p_valores,
+            'martingale': martingale,
+            'deteccoes': deteccoes,
+            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None
+        }
+    
+    def detectar_drift_multivariado(self, df_variaveis, tipo_martingale='power'):
+        """
+        Detecta drift considerando múltiplas variáveis simultaneamente
+        """
+        n = len(df_variaveis)
+        scores = np.zeros(n)
+        p_valores = np.zeros(n)
+        
+        # Normalizar dados
+        scaler = StandardScaler()
+        dados_norm = scaler.fit_transform(df_variaveis)
+        
+        # Calcular scores e p-valores
+        for t in range(n):
+            if t < self.janela_calibracao:
+                scores[t] = 0
+                p_valores[t] = 1.0
+            else:
+                historico = dados_norm[max(0, t-self.janela_calibracao):t]
+                valor_atual = dados_norm[t]
+                
+                scores[t] = self.calcular_score_nao_conformidade(
+                    historico, valor_atual, metodo='mahalanobis'
+                )
+                
+                scores_hist = scores[max(0, t-self.janela_calibracao):t]
+                p_valores[t] = self.calcular_pvalor_conformal(scores_hist, scores[t])
+        
+        # Calcular martingale
+        if tipo_martingale == 'power':
+            martingale = self.power_martingale(p_valores)
+        else:
+            martingale = self.simple_jumper_martingale(p_valores)
+        
+        # Detectar quando martingale ultrapassa threshold
+        deteccoes = martingale > self.threshold
+        
+        return {
+            'scores': scores,
+            'p_valores': p_valores,
+            'martingale': martingale,
+            'deteccoes': deteccoes,
+            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None
+        }
+
+# =============================================================================
+# 3. IMPLEMENTAÇÃO DOS MÉTODOS DE COMPARAÇÃO
+# =============================================================================
+
+class MetodosClassicosDrift:
+    """
+    Implementação de métodos clássicos de detecção de drift
+    """
+    
+    @staticmethod
+    def cusum(serie, threshold=5, drift=1):
+        """
+        CUSUM (Cumulative Sum)
+        """
+        n = len(serie)
+        cusum_pos = np.zeros(n)
+        cusum_neg = np.zeros(n)
+        deteccoes = np.zeros(n, dtype=bool)
+        
+        media = np.mean(serie[:30])  # Média inicial
+        
+        for t in range(1, n):
+            cusum_pos[t] = max(0, cusum_pos[t-1] + serie[t] - media - drift)
+            cusum_neg[t] = max(0, cusum_neg[t-1] + media - serie[t] - drift)
+            
+            if cusum_pos[t] > threshold or cusum_neg[t] > threshold:
+                deteccoes[t] = True
+                # Reset após detecção
+                cusum_pos[t] = 0
+                cusum_neg[t] = 0
+                media = np.mean(serie[max(0, t-30):t+1])
+        
+        return {
+            'estatistica': cusum_pos + cusum_neg,
+            'deteccoes': deteccoes,
+            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None
+        }
+    
+    @staticmethod
+    def ewma(serie, lambda_param=0.2, L=3):
+        """
+        EWMA (Exponentially Weighted Moving Average)
+        """
+        n = len(serie)
+        ewma = np.zeros(n)
+        deteccoes = np.zeros(n, dtype=bool)
+        
+        media_inicial = np.mean(serie[:30])
+        std_inicial = np.std(serie[:30])
+        
+        ewma[0] = media_inicial
+        
+        for t in range(1, n):
+            ewma[t] = lambda_param * serie[t] + (1 - lambda_param) * ewma[t-1]
+            
+            # Limites de controle
+            std_ewma = std_inicial * np.sqrt(lambda_param / (2 - lambda_param))
+            limite_sup = media_inicial + L * std_ewma
+            limite_inf = media_inicial - L * std_ewma
+            
+            if ewma[t] > limite_sup or ewma[t] < limite_inf:
+                deteccoes[t] = True
+        
+        return {
+            'estatistica': ewma,
+            'deteccoes': deteccoes,
+            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None
+        }
+    
+    @staticmethod
+    def page_hinkley(serie, delta=0.005, lambda_param=50):
+        """
+        Page-Hinkley Test
+        """
+        n = len(serie)
+        m_t = np.zeros(n)
+        M_t = np.zeros(n)
+        deteccoes = np.zeros(n, dtype=bool)
+        
+        media_acum = 0
+        
+        for t in range(n):
+            media_acum = (media_acum * t + serie[t]) / (t + 1)
+            m_t[t] = (serie[t] - media_acum - delta) + (m_t[t-1] if t > 0 else 0)
+            M_t[t] = max(M_t[t-1] if t > 0 else 0, m_t[t])
+            
+            if M_t[t] - m_t[t] > lambda_param:
+                deteccoes[t] = True
+        
+        return {
+            'estatistica': M_t - m_t,
+            'deteccoes': deteccoes,
+            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None
+        }
+    
+    @staticmethod
+    def ddm(serie, n_min=30, warning_level=2.0, drift_level=3.0):
+        """
+        DDM (Drift Detection Method)
+        """
+        n = len(serie)
+        deteccoes = np.zeros(n, dtype=bool)
+        avisos = np.zeros(n, dtype=bool)
+        
+        erros = np.abs(serie - np.mean(serie[:30]))  # Simplificação: erro como desvio da média inicial
+        
+        p_min = float('inf')
+        s_min = float('inf')
+        
+        for t in range(n_min, n):
+            p_t = np.mean(erros[:t+1])
+            s_t = np.std(erros[:t+1])
+            
+            if p_t + s_t < p_min + s_min:
+                p_min = p_t
+                s_min = s_t
+            
+            if p_t + s_t > p_min + warning_level * s_min:
+                avisos[t] = True
+                
+            if p_t + s_t > p_min + drift_level * s_min:
+                deteccoes[t] = True
+        
+        return {
+            'estatistica': np.array([np.mean(erros[:t+1]) + np.std(erros[:t+1]) for t in range(n)]),
+            'deteccoes': deteccoes,
+            'avisos': avisos,
+            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None
+        }
+    
+    @staticmethod
+    def eddm(serie, n_min=30, warning_level=0.9, drift_level=0.95):
+        """
+        EDDM (Early Drift Detection Method)
+        """
+        n = len(serie)
+        deteccoes = np.zeros(n, dtype=bool)
+        avisos = np.zeros(n, dtype=bool)
+        
+        erros = np.abs(serie - np.mean(serie[:30]))
+        distancias = np.diff(np.where(erros > np.median(erros))[0], prepend=0)
+        
+        if len(distancias) < 2:
+            return {
+                'estatistica': np.zeros(n),
+                'deteccoes': deteccoes,
+                'avisos': avisos,
+                'primeira_deteccao': None
+            }
+        
+        dist_max = 0
+        s_max = 0
+        
+        estatistica = np.zeros(n)
+        
+        for t in range(n_min, n):
+            if t < len(distancias):
+                dist_media = np.mean(distancias[:t+1])
+                s_t = np.std(distancias[:t+1])
+                
+                if dist_media + 2 * s_t > dist_max + 2 * s_max:
+                    dist_max = dist_media
+                    s_max = s_t
+                
+                ratio = (dist_media + 2 * s_t) / (dist_max + 2 * s_max + 1e-8)
+                estatistica[t] = ratio
+                
+                if ratio < warning_level:
+                    avisos[t] = True
+                    
+                if ratio < drift_level:
+                    deteccoes[t] = True
+        
+        return {
+            'estatistica': estatistica,
+            'deteccoes': deteccoes,
+            'avisos': avisos,
+            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None
+        }
+    
+    @staticmethod
+    def adwin(serie, delta=0.002):
+        """
+        ADWIN (Adaptive Windowing)
+        Implementação simplificada
+        """
+        n = len(serie)
+        deteccoes = np.zeros(n, dtype=bool)
+        estatistica = np.zeros(n)
+        
+        window = []
+        
+        for t in range(n):
+            window.append(serie[t])
+            
+            # Verificar se deve cortar a janela
+            if len(window) > 10:
+                for cut in range(1, len(window)-1):
+                    w0 = window[:cut]
+                    w1 = window[cut:]
+                    
+                    mean0 = np.mean(w0)
+                    mean1 = np.mean(w1)
+                    
+                    epsilon_cut = np.sqrt(2 * np.log(2 * len(window) / delta) / (2 * min(len(w0), len(w1))))
+                    
+                    if abs(mean0 - mean1) > epsilon_cut:
+                        deteccoes[t] = True
+                        window = window[cut:]  # Remover parte antiga
+                        break
+            
+            estatistica[t] = len(window)
+        
+        return {
+            'estatistica': estatistica,
+            'deteccoes': deteccoes,
+            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None
+        }
+
+# =============================================================================
+# 4. ANÁLISE E VISUALIZAÇÃO
+# =============================================================================
+
+def analisar_drift_completo(df_agencia, variaveis=['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']):
+    """
+    Executa análise completa de drift com todos os métodos
+    """
+    resultados = {}
+    
+    # Data de referência para pandemia
+    data_pandemia = pd.to_datetime('2020-03-01')
+    idx_pandemia = (df_agencia['DATA'] >= data_pandemia).argmax()
+    
+    # Configurar detectores
+    detector_conformal = ConformalDriftDetector(alpha=0.05)
+    metodos_classicos = MetodosClassicosDrift()
+    
+    # Para cada variável
+    for var in variaveis:
+        print(f"\nAnalisando variável: {var}")
+        serie = df_agencia[var].values
+        
+        resultados[var] = {
+            'conformal_power': detector_conformal.detectar_drift_univariado(serie, 'power'),
+            'conformal_jumper': detector_conformal.detectar_drift_univariado(serie, 'jumper'),
+            'cusum': metodos_classicos.cusum(serie),
+            'ewma': metodos_classicos.ewma(serie),
+            'page_hinkley': metodos_classicos.page_hinkley(serie),
+            'ddm': metodos_classicos.ddm(serie),
+            'eddm': metodos_classicos.eddm(serie),
+            'adwin': metodos_classicos.adwin(serie)
+        }
+    
+    # Análise multivariada
+    print("\nAnalisando todas as variáveis em conjunto (multivariada)")
+    df_vars = df_agencia[variaveis]
+    
+    resultados['multivariada'] = {
+        'conformal_power': detector_conformal.detectar_drift_multivariado(df_vars, 'power'),
+        'conformal_jumper': detector_conformal.detectar_drift_multivariado(df_vars, 'jumper')
+    }
+    
+    # Adicionar informações temporais
+    resultados['info'] = {
+        'datas': df_agencia['DATA'],
+        'idx_pandemia': idx_pandemia,
+        'data_pandemia': data_pandemia
+    }
+    
+    return resultados
+
+def visualizar_resultados(resultados, variavel='SAQUE'):
+    """
+    Cria visualizações dos resultados
+    """
+    fig, axes = plt.subplots(4, 2, figsize=(20, 16))
+    axes = axes.flatten()
+    
+    datas = resultados['info']['datas']
+    idx_pandemia = resultados['info']['idx_pandemia']
+    
+    metodos = ['conformal_power', 'conformal_jumper', 'cusum', 'ewma', 
+               'page_hinkley', 'ddm', 'eddm', 'adwin']
+    
+    for idx, metodo in enumerate(metodos):
+        ax = axes[idx]
+        
+        if metodo in resultados[variavel]:
+            res = resultados[variavel][metodo]
+            
+            # Plot da estatística principal
+            if metodo.startswith('conformal'):
+                y = res['martingale']
+                ax.set_yscale('log')
+                ylabel = 'Martingale'
+            else:
+                y = res['estatistica']
+                ylabel = 'Estatística'
+            
+            ax.plot(datas, y, label=metodo, linewidth=2)
+            
+            # Marcar detecções
+            if res['primeira_deteccao'] is not None:
+                ax.axvline(datas.iloc[res['primeira_deteccao']], 
+                          color='red', linestyle='--', alpha=0.7,
+                          label=f'Detecção: {datas.iloc[res["primeira_deteccao"]].strftime("%Y-%m-%d")}')
+            
+            # Marcar pandemia
+            ax.axvline(datas.iloc[idx_pandemia], color='black', 
+                      linestyle='--', alpha=0.5, label='Início Pandemia')
+            
+            # Threshold para métodos conformais
+            if metodo.startswith('conformal'):
+                detector = ConformalDriftDetector()
+                ax.axhline(detector.threshold, color='orange', 
+                          linestyle=':', label=f'Threshold ({detector.threshold:.1f})')
+            
+            ax.set_title(f'{metodo.upper()} - {variavel}')
+            ax.set_xlabel('Data')
+            ax.set_ylabel(ylabel)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Rotacionar labels do eixo x
+            ax.tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.show()
+
+def criar_tabela_comparativa(resultados, variaveis=['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']):
+    """
+    Cria tabela comparativa dos métodos
+    """
+    data_pandemia = resultados['info']['data_pandemia']
+    datas = resultados['info']['datas']
+    
+    comparacao = []
+    
+    for var in variaveis:
+        for metodo, res in resultados[var].items():
+            if res['primeira_deteccao'] is not None:
+                data_deteccao = datas.iloc[res['primeira_deteccao']]
+                dias_apos_pandemia = (data_deteccao - data_pandemia).days
+                falsos_positivos = sum(res['deteccoes'][:resultados['info']['idx_pandemia']])
+                
+                comparacao.append({
+                    'Variável': var,
+                    'Método': metodo,
+                    'Data Detecção': data_deteccao.strftime('%Y-%m-%d'),
+                    'Dias após Pandemia': dias_apos_pandemia,
+                    'Falsos Positivos': falsos_positivos
+                })
+            else:
+                comparacao.append({
+                    'Variável': var,
+                    'Método': metodo,
+                    'Data Detecção': 'Não detectado',
+                    'Dias após Pandemia': np.inf,
+                    'Falsos Positivos': 0
+                })
+    
+    # Adicionar análise multivariada
+    for metodo, res in resultados['multivariada'].items():
+        if res['primeira_deteccao'] is not None:
+            data_deteccao = datas.iloc[res['primeira_deteccao']]
+            dias_apos_pandemia = (data_deteccao - data_pandemia).days
+            falsos_positivos = sum(res['deteccoes'][:resultados['info']['idx_pandemia']])
+            
+            comparacao.append({
+                'Variável': 'MULTIVARIADA',
+                'Método': metodo,
+                'Data Detecção': data_deteccao.strftime('%Y-%m-%d'),
+                'Dias após Pandemia': dias_apos_pandemia,
+                'Falsos Positivos': falsos_positivos
+            })
+        else:
+            comparacao.append({
+                'Variável': 'MULTIVARIADA',
+                'Método': metodo,
+                'Data Detecção': 'Não detectado',
+                'Dias após Pandemia': np.inf,
+                'Falsos Positivos': 0
+            })
+    
+    df_comparacao = pd.DataFrame(comparacao)
+    
+    # Ordenar por velocidade de detecção
+    df_comparacao = df_comparacao.sort_values('Dias após Pandemia')
+    
+    return df_comparacao
+
+def plotar_pvalores_evolution(resultados, variavel='SAQUE'):
+    """
+    Visualiza a evolução dos p-valores ao longo do tempo
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
+    
+    datas = resultados['info']['datas']
+    idx_pandemia = resultados['info']['idx_pandemia']
+    
+    # P-valores Conformal Power
+    p_valores_power = resultados[variavel]['conformal_power']['p_valores']
+    ax1.plot(datas, p_valores_power, label='P-valores', color='blue', alpha=0.7)
+    ax1.axvline(datas.iloc[idx_pandemia], color='red', linestyle='--', 
+                label='Início Pandemia', alpha=0.7)
+    ax1.set_ylabel('P-valor')
+    ax1.set_title(f'Evolução dos P-valores - {variavel}')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Scores de não-conformidade
+    scores = resultados[variavel]['conformal_power']['scores']
+    ax2.plot(datas, scores, label='Scores', color='green', alpha=0.7)
+    ax2.axvline(datas.iloc[idx_pandemia], color='red', linestyle='--', alpha=0.7)
+    ax2.set_ylabel('Score de Não-Conformidade')
+    ax2.set_xlabel('Data')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# =============================================================================
+# 5. FUNÇÃO PRINCIPAL DE EXECUÇÃO
+# =============================================================================
+
+def executar_analise_drift(filepath_csv, agencia_id=None):
+    """
+    Função principal que executa toda a análise de drift
+    """
+    print("=== INICIANDO ANÁLISE DE DRIFT - PROJETO NUMERÁRIOS ===\n")
+    
+    # 1. Carregar dados
+    print("1. Carregando dados...")
+    df = carregar_dados_numerarios(filepath_csv)
+    
+    # Se não especificar agência, pegar a primeira
+    if agencia_id is None:
+        agencia_id = df['AGENCIA'].iloc[0]
+    
+    print(f"   Agência selecionada: {agencia_id}")
+    df_agencia = preparar_dados_agencia(df, agencia_id)
+    print(f"   Total de observações: {len(df_agencia)}")
+    print(f"   Período: {df_agencia['DATA'].min()} a {df_agencia['DATA'].max()}")
+    
+    # 2. Executar análise
+    print("\n2. Executando análise de drift...")
+    resultados = analisar_drift_completo(df_agencia)
+    
+    # 3. Criar visualizações
+    print("\n3. Gerando visualizações...")
+    
+    # Visualizar resultados para cada variável
+    for var in ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']:
+        print(f"\n   Visualizando: {var}")
+        visualizar_resultados(resultados, var)
+        plotar_pvalores_evolution(resultados, var)
+    
+    # 4. Criar tabela comparativa
+    print("\n4. Criando tabela comparativa...")
+    df_comparacao = criar_tabela_comparativa(resultados)
+    
+    print("\n=== TABELA COMPARATIVA DE MÉTODOS ===")
+    print(df_comparacao.to_string(index=False))
+    
+    # 5. Salvar resultados
+    print("\n5. Salvando resultados...")
+    df_comparacao.to_csv('resultados_drift_detection.csv', index=False)
+    
+    # 6. Análise final
+    print("\n=== ANÁLISE FINAL ===")
+    
+    # Melhor método por variável
+    for var in ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI', 'MULTIVARIADA']:
+        df_var = df_comparacao[df_comparacao['Variável'] == var]
+        df_var = df_var[df_var['Dias após Pandemia'] != np.inf]
+        
+        if not df_var.empty:
+            melhor = df_var.iloc[0]
+            print(f"\n{var}:")
+            print(f"  Melhor método: {melhor['Método']}")
+            print(f"  Detectou em: {melhor['Data Detecção']} ({melhor['Dias após Pandemia']} dias após pandemia)")
+            print(f"  Falsos positivos: {melhor['Falsos Positivos']}")
+    
+    return resultados, df_comparacao
+
+# =============================================================================
+# 6. ANÁLISE AVANÇADA - JANELA DE REFERÊNCIA
+# =============================================================================
+
+def analisar_variacao_janela_referencia(df_agencia, janela_previsao=30):
+    """
+    Analisa a variação entre as previsões e suas datas de referência
+    considerando a janela de 30 dias de previsão
+    """
+    resultados_janela = {}
+    
+    # Para cada variável
+    for var in ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']:
+        print(f"\nAnalisando variação de janela para: {var}")
+        
+        # Calcular diferença temporal entre DATA_PREVISAO e DATA_REFERENCIA
+        df_agencia['dias_antecedencia'] = (
+            df_agencia['DATA_PREVISAO'] - df_agencia['DATA_REFERENCIA']
+        ).dt.days
+        
+        # Agrupar por janela de previsão
+        variacoes = []
+        
+        for i in range(len(df_agencia) - janela_previsao):
+            janela = df_agencia.iloc[i:i+janela_previsao]
+            
+            # Variação dentro da janela
+            variacao = janela[var].std() / (janela[var].mean() + 1e-8)
+            variacoes.append({
+                'data_inicio': janela['DATA'].iloc[0],
+                'data_fim': janela['DATA'].iloc[-1],
+                'variacao': variacao,
+                'media': janela[var].mean(),
+                'std': janela[var].std()
+            })
+        
+        resultados_janela[var] = pd.DataFrame(variacoes)
+        
+        # Detectar mudanças significativas na variação
+        detector = ConformalDriftDetector(alpha=0.05, janela_calibracao=60)
+        serie_variacao = resultados_janela[var]['variacao'].values
+        
+        drift_variacao = detector.detectar_drift_univariado(serie_variacao, 'power')
+        resultados_janela[f'{var}_drift'] = drift_variacao
+    
+    return resultados_janela
+
+# =============================================================================
+# EXEMPLO DE USO
+# =============================================================================
+
+if __name__ == "__main__":
+    # Exemplo de uso com o arquivo fornecido
+    # Substitua pelo caminho correto do arquivo
+    filepath = "previsoes_numerario_pre_pos_pandemia.csv"
+    
+    # Executar análise completa
+    # resultados, df_comparacao = executar_analise_drift(filepath)
+    
+    print("\nFramework de detecção de drift implementado com sucesso!")
+    print("Para executar a análise, use:")
+    print("resultados, df_comparacao = executar_analise_drift('seu_arquivo.csv', agencia_id)")
