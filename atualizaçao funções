@@ -1,0 +1,253 @@
+def calcular_pvalores_pre_pos_pandemia(previsoes, pandemic_idx, janela_dias=None):
+    """
+    Calcula p-valores comparando cada previsão pós-pandemia 
+    com a distribuição pré-pandemia.
+    """
+    N = len(previsoes)
+    p_values = np.ones(N)
+    
+    # Previsões pré-pandemia (referência)
+    pre_pandemic = previsoes[:pandemic_idx]
+    
+    # Para cada observação pós-pandemia
+    for i in range(pandemic_idx, N):
+        atual = previsoes[i]
+        
+        # Define janela de comparação
+        if janela_dias and i - pandemic_idx > janela_dias:
+            # Janela deslizante: últimos X dias pré + pós
+            inicio = i - janela_dias
+            referencia = previsoes[inicio:i]
+        else:
+            # Compara com todo período pré-pandemia
+            referencia = pre_pandemic
+        
+        # P-valor = proporção de valores na referência >= atual
+        if len(referencia) > 0:
+            p_values[i] = np.mean(referencia >= atual)
+        
+    return p_values
+
+######
+def calcular_pvalores_conformal_pre_pos(previsoes, pandemic_idx):
+    """
+    Usa scores de não-conformidade comparando com distribuição pré-pandemia.
+    """
+    N = len(previsoes)
+    p_values = np.ones(N)
+    
+    # Calcula média e desvio pré-pandemia
+    pre_pandemic = previsoes[:pandemic_idx]
+    media_pre = np.mean(pre_pandemic)
+    std_pre = np.std(pre_pandemic)
+    
+    if std_pre == 0:
+        return p_values
+    
+    # Score de não-conformidade para cada ponto
+    scores = np.abs(previsoes - media_pre) / std_pre
+    
+    # Para cada observação
+    for i in range(N):
+        if i < pandemic_idx:
+            # Pré-pandemia: compara com outros pontos pré
+            referencia_scores = scores[:pandemic_idx]
+        else:
+            # Pós-pandemia: compara com pré-pandemia
+            referencia_scores = scores[:pandemic_idx]
+        
+        # P-valor conformal
+        p_values[i] = np.mean(referencia_scores >= scores[i])
+    
+    return p_values
+
+########
+def calcular_pvalores_distribuicao(previsoes, pandemic_idx, metodo='ks'):
+    """
+    Testa se a distribuição mudou usando testes estatísticos.
+    """
+    from scipy import stats
+    
+    N = len(previsoes)
+    p_values = np.ones(N)
+    
+    pre_pandemic = previsoes[:pandemic_idx]
+    
+    # Para cada ponto pós-pandemia, testa se vem da mesma distribuição
+    for i in range(pandemic_idx, N):
+        # Janela atual
+        window_size = min(30, i - pandemic_idx + 1)
+        current_window = previsoes[i-window_size+1:i+1]
+        
+        if metodo == 'ks':
+            # Teste Kolmogorov-Smirnov
+            _, p_value = stats.ks_2samp(pre_pandemic, current_window)
+        elif metodo == 'mw':
+            # Teste Mann-Whitney
+            _, p_value = stats.mannwhitneyu(pre_pandemic, current_window)
+        elif metodo == 't':
+            # Teste t
+            _, p_value = stats.ttest_ind(pre_pandemic, current_window)
+        
+        p_values[i] = p_value
+    
+    return p_values
+
+########
+def run_complete_drift_analysis(data_dict, variable='SAQUE'):
+    """
+    Executa análise de drift comparando previsões pré vs pós pandemia.
+    """
+    full_data = data_dict['full_data']
+    pandemic_idx = data_dict['pandemic_index']
+    
+    if variable not in full_data.columns:
+        print(f"❌ Variável {variable} não encontrada!")
+        return {}
+    
+    previsoes = full_data[variable].values
+    
+    print(f"📊 Analisando drift nas previsões de {variable}")
+    print(f"   Previsões pré-pandemia: {pandemic_idx}")
+    print(f"   Previsões pós-pandemia: {len(previsoes) - pandemic_idx}")
+    
+    # Estatísticas básicas
+    pre = previsoes[:pandemic_idx]
+    pos = previsoes[pandemic_idx:]
+    print(f"   Média pré: {np.mean(pre):.2f}, pós: {np.mean(pos):.2f}")
+    print(f"   Std pré: {np.std(pre):.2f}, pós: {np.std(pos):.2f}")
+    
+    results = {}
+    
+    # Diferentes abordagens de cálculo de p-valor
+    metodos_pvalue = {
+        'conformal': lambda: calcular_pvalores_pre_pos_pandemia(previsoes, pandemic_idx),
+        'score': lambda: calcular_pvalores_conformal_pre_pos(previsoes, pandemic_idx),
+        'ks_test': lambda: calcular_pvalores_distribuicao(previsoes, pandemic_idx, 'ks')
+    }
+    
+    for metodo_nome, metodo_func in metodos_pvalue.items():
+        print(f"\n📊 Calculando p-valores método: {metodo_nome}")
+        
+        # Calcula p-valores
+        p_values = metodo_func()
+        
+        # Calcula martingales
+        M_power = power_martingale_cumprod(p_values)
+        M_jumper = simple_jumper_martingale(p_values)
+        
+        # Armazena resultados (compatível com visualizações)
+        for janela in ['todas', '30_dias']:
+            key = f'{janela}_{metodo_nome}'
+            results[key] = {
+                'p_det': p_values,
+                'p_rnd': p_values,  # Mesmo valor para simplificar
+                'M_power_cumprod': M_power,
+                'M_power_incremental': M_power,
+                'M_jumper': M_jumper,
+                'pandemic_idx': pandemic_idx
+            }
+    
+    return results
+
+#######
+# Para uma análise rápida e direta
+def analise_rapida_pre_pos(df, agencia, variable='SAQUE'):
+    """
+    Análise rápida comparando pré vs pós pandemia.
+    """
+    df_ag = df[df['AGENCIA'] == agencia]
+    pandemic_date = pd.to_datetime('2020-03-01')
+    
+    pre = df_ag[df_ag['DATA'] < pandemic_date][variable].values
+    pos = df_ag[df_ag['DATA'] >= pandemic_date][variable].values
+    
+    # Testes estatísticos
+    from scipy import stats
+    
+    # Teste t
+    t_stat, p_t = stats.ttest_ind(pre, pos)
+    
+    # Teste KS
+    ks_stat, p_ks = stats.ks_2samp(pre, pos)
+    
+    # Teste Mann-Whitney
+    mw_stat, p_mw = stats.mannwhitneyu(pre, pos)
+    
+    print(f"\nTestes Estatísticos para {variable}:")
+    print(f"Teste t: p-valor = {p_t:.4f}")
+    print(f"Teste KS: p-valor = {p_ks:.4f}")
+    print(f"Teste Mann-Whitney: p-valor = {p_mw:.4f}")
+    
+    if p_t < 0.05 and p_ks < 0.05:
+        print("✅ DRIFT DETECTADO: Distribuições significativamente diferentes")
+    else:
+        print("❌ SEM DRIFT: Distribuições similares")
+
+########
+
+def calcular_pvalores_previsoes_drift(previsoes, janela_dias=None, rtol=1e-03, atol=1e-03):
+    """
+    Calcula p-valores para detectar mudanças nas PREVISÕES ao longo do tempo.
+    Não compara com valores reais, apenas detecta mudança de comportamento.
+    """
+    N = len(previsoes)
+    p_det = np.zeros(N)
+    p_rnd = np.zeros(N)
+    
+    for n in tqdm(range(N), desc="P-valores (drift em previsões)"):
+        if n == 0:
+            p_det[0] = 1.0
+            p_rnd[0] = 1.0
+            continue
+        
+        # Define janela de comparação
+        if janela_dias is not None and janela_dias < n:
+            inicio = n - janela_dias
+        else:
+            inicio = 0
+        
+        # Anteriores e atual
+        anteriores = previsoes[inicio:n]
+        atual = previsoes[n]
+        
+        # Score = desvio da previsão atual em relação às anteriores
+        media_anteriores = np.mean(anteriores)
+        std_anteriores = np.std(anteriores) if len(anteriores) > 1 else 1.0
+        
+        if std_anteriores > 0:
+            score_atual = np.abs(atual - media_anteriores) / std_anteriores
+        else:
+            score_atual = np.abs(atual - media_anteriores)
+        
+        # Calcula scores para todas as anteriores
+        scores = []
+        for i in range(inicio, n):
+            if i > inicio:
+                media_i = np.mean(previsoes[inicio:i])
+                std_i = np.std(previsoes[inicio:i]) if i - inicio > 1 else 1.0
+                if std_i > 0:
+                    score_i = np.abs(previsoes[i] - media_i) / std_i
+                else:
+                    score_i = np.abs(previsoes[i] - media_i)
+                scores.append(score_i)
+        
+        scores.append(score_atual)
+        scores = np.array(scores)
+        
+        # P-valor determinístico
+        if len(scores) > 0:
+            p_det[n] = np.mean(scores >= score_atual)
+        else:
+            p_det[n] = 1.0
+        
+        # P-valor randomizado
+        countG = np.sum(scores > score_atual)
+        countE = np.sum(np.isclose(scores, score_atual, rtol=rtol, atol=atol))
+        u = np.random.uniform() if countE > 0 else 0
+        p_rnd[n] = (countG + u * countE) / len(scores) if len(scores) > 0 else 1.0
+    
+    return p_det, p_rnd
+
+
+#####################
