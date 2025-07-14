@@ -1,886 +1,577 @@
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "# Framework AutoMLOps - Detecção de Drift para Projeto Numerários\n",
-    "\n",
-    "## Objetivo\n",
-    "\n",
-    "Este notebook implementa um sistema de detecção de drift baseado em métodos conformais com martingales, adaptado especificamente para o projeto Numerários. O sistema monitora as previsões de demanda de numerário (SAQUE, SAQUE_CEI, DEPOSITO, DEP_CEI) para identificar quando o modelo precisa ser retreinado.\n",
-    "\n",
-    "## Estrutura\n",
-    "\n",
-    "1. **Importação de bibliotecas**\n",
-    "2. **Carregamento e preparação dos dados**\n",
-    "3. **Criação das features de calendário**\n",
-    "4. **Implementação do método conformal**\n",
-    "5. **Detecção de drift**\n",
-    "6. **Visualização e análise**\n",
-    "7. **Resultados e recomendações**"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 1. Importação de Bibliotecas\n",
-    "\n",
-    "Importamos todas as bibliotecas necessárias para análise"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Bibliotecas básicas\n",
-    "import pandas as pd\n",
-    "import numpy as np\n",
-    "from datetime import datetime, timedelta\n",
-    "import warnings\n",
-    "warnings.filterwarnings('ignore')\n",
-    "\n",
-    "# Visualização\n",
-    "import matplotlib.pyplot as plt\n",
-    "import seaborn as sns\n",
-    "plt.style.use('seaborn-v0_8-darkgrid')\n",
-    "sns.set_palette(\"husl\")\n",
-    "\n",
-    "# Estatística\n",
-    "from scipy import stats\n",
-    "from sklearn.preprocessing import StandardScaler\n",
-    "\n",
-    "# Progresso\n",
-    "from tqdm import tqdm\n",
-    "\n",
-    "print(\"Bibliotecas importadas com sucesso!\")"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 2. Carregamento dos Dados\n",
-    "\n",
-    "Carregamos os dados de previsões do modelo Numerários"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "def carregar_dados_numerarios(filepath):\n",
-    "    \"\"\"\n",
-    "    Carrega os dados de previsões do modelo Numerários\n",
-    "    \n",
-    "    Args:\n",
-    "        filepath: caminho para o arquivo CSV\n",
-    "        \n",
-    "    Returns:\n",
-    "        DataFrame com os dados carregados e datas convertidas\n",
-    "    \"\"\"\n",
-    "    # Carregar dados\n",
-    "    prep_dados = pd.read_csv(filepath)\n",
-    "    \n",
-    "    # Converter colunas de data\n",
-    "    prep_dados['DATA'] = pd.to_datetime(prep_dados['DATA'])\n",
-    "    prep_dados['DATA_REFERENCIA'] = pd.to_datetime(prep_dados['DATA_REFERENCIA'], errors='coerce')\n",
-    "    prep_dados['DATA_PREVISAO'] = pd.to_datetime(prep_dados['DATA_PREVISAO'])\n",
-    "    \n",
-    "    # Calcular horizonte de previsão\n",
-    "    prep_dados['HORIZONTE_DIAS'] = (prep_dados['DATA'] - prep_dados['DATA_REFERENCIA']).dt.days\n",
-    "    \n",
-    "    # Ordenar por agência e data de previsão\n",
-    "    prep_dados = prep_dados.sort_values(['AGENCIA', 'DATA_PREVISAO', 'DATA']).reset_index(drop=True)\n",
-    "    \n",
-    "    print(f\"Dados carregados: {len(prep_dados)} observações\")\n",
-    "    print(f\"Período de execução: {prep_dados['DATA_PREVISAO'].min()} a {prep_dados['DATA_PREVISAO'].max()}\")\n",
-    "    print(f\"Período de inferência: {prep_dados['DATA'].min()} a {prep_dados['DATA'].max()}\")\n",
-    "    print(f\"Agências: {prep_dados['AGENCIA'].nunique()}\")\n",
-    "    \n",
-    "    return prep_dados\n",
-    "\n",
-    "# Carregar dados (substitua pelo caminho do seu arquivo)\n",
-    "# prep_dados = carregar_dados_numerarios('previsoes_numerario_pre_pos_pandemia.csv')"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 3. Criação das Features de Calendário\n",
-    "\n",
-    "Implementamos todas as 22+ features de calendário utilizadas no modelo Numerários"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "def criarVariaveis(prep_dados):\n",
-    "    \"\"\"\n",
-    "    Cria todas as features de calendário do modelo Numerários\n",
-    "    \"\"\"\n",
-    "    # 1 - 8: Gera as variáveis mais básicas do calendário\n",
-    "    prep_dados['DIA_SEMANA'] = prep_dados['DATA'].apply(lambda x: int(x.weekday())+2 if int(x.weekday())+2<=8 else 1)\n",
-    "    prep_dados['ANO'] = prep_dados['DATA'].apply(lambda x: x.year)\n",
-    "    prep_dados['MES'] = prep_dados['DATA'].apply(lambda x: x.month)\n",
-    "    prep_dados['DIA_MES'] = prep_dados['DATA'].apply(lambda x: x.day)\n",
-    "    prep_dados['SEMANA_MES'] = prep_dados['DATA'].apply(lambda x: x.day//7)\n",
-    "    prep_dados['DIA_FERIADO'] = prep_dados['FERIADO'].apply(lambda x: math.ceil(x.day/7))\n",
-    "    prep_dados['DIA_UTIL'] = 0\n",
-    "    prep_dados.loc[(prep_dados['DIA_SEMANA']>=2)&(prep_dados['DIA_SEMANA']<=6)&(prep_dados['DIA_FERIADO']==0),'DIA_UTIL'] = 1\n",
-    "    prep_dados.loc[(prep_dados['DIA_SEMANA']>=2)&(prep_dados['DIA_SEMANA']<=6)&(prep_dados['DIA_FERIADO']==1),'DIA_FERIADO_UTIL'] = 1\n",
-    "    \n",
-    "    # 9: quantidade de dias fechado depois\n",
-    "    # ordena as datas para fazer a contagem\n",
-    "    prep_dados['switch'] = (prep_dados['DIA_UTIL'].shift(1) != prep_dados['DIA_UTIL']).astype(int)\n",
-    "    prep_dados['DIA_UTIL_GROUPS'] = prep_dados.groupby('AGENCIA')['switch'].cumsum()\n",
-    "    \n",
-    "    prep_dados['QTD_DIAS_FECHADO_DEPOIS_LEG'] = prep_dados.sort_values('DATA', ascending=False).groupby(['AGENCIA', 'DIA_UTIL_GROUPS']).cumcount() + 1\n",
-    "    prep_dados = prep_dados.drop(columns=['switch', 'DIA_UTIL_GROUPS'])\n",
-    "    \n",
-    "    # desloca a serie para colocar na linha correta a quantidade de dias fechados depois\n",
-    "    prep_dados['QTD_DIAS_FECHADO_DEPOIS'] = prep_dados.groupby(['AGENCIA'])['QTD_DIAS_FECHADO_DEPOIS_LEG'].shift(-1).fillna(0)\n",
-    "    prep_dados['QTD_DIAS_FECHADO_ANTES'] = prep_dados.groupby(['AGENCIA'])['QTD_DIAS_FECHADO_ANTES_LEG'].shift(1).fillna(0)\n",
-    "    prep_dados['QTD_DIAS_FECHADO_DEPOIS'] = prep_dados['QTD_DIAS_FECHADO_DEPOIS'].astype(int)\n",
-    "    \n",
-    "    # zera a serie para os outros dias\n",
-    "    prep_dados.loc[(prep_dados.DIA_UTIL != 1) | (prep_dados.QTD_DIAS_FECHADO_DEPOIS_LEG != 1)), 'QTD_DIAS_FECHADO_DEPOIS'] = 0\n",
-    "    \n",
-    "    # 10: quantidade de dias fechado antes\n",
-    "    # cria variavel auxiliar\n",
-    "    prep_dados['switch'] = (prep_dados['DIA_UTIL'].shift(1) != prep_dados['DIA_UTIL']).astype(int)\n",
-    "    prep_dados['DIA_UTIL_GROUPS'] = prep_dados.groupby('AGENCIA')['switch'].cumsum()\n",
-    "    prep_dados['QTD_DIAS_FECHADO_ANTES_LEG'] = prep_dados.sort_values('DATA', ascending=True).groupby(['AGENCIA', 'DIA_UTIL_GROUPS']).cumcount() + 1\n",
-    "    prep_dados = prep_dados.drop(columns=['switch', 'DIA_UTIL_GROUPS'])\n",
-    "    \n",
-    "    # apaga as series auxiliares criadas\n",
-    "    prep_dados.drop(columns =[\"QTD_DIAS_FECHADO_ANTES_LEG\", \"QTD_DIAS_FECHADO_DEPOIS_LEG\"], inplace=True)\n",
-    "    \n",
-    "    # 11 - 12: copia as series para representacao numerica da variavel\n",
-    "    prep_dados['QTD_DIAS_FECHADO_DEPOIS_NUM'] = prep_dados['QTD_DIAS_FECHADO_DEPOIS']\n",
-    "    prep_dados['QTD_DIAS_FECHADO_ANTES_NUM'] = prep_dados['QTD_DIAS_FECHADO_ANTES']\n",
-    "    \n",
-    "    # obs: para essas series as datas precisam começar e\n",
-    "    # terminar no primeiro e no ultimo dia do mes respectivamente\n",
-    "    \n",
-    "    # 13: sequencia dia util positiva\n",
-    "    prep_dados['SEQ_DIA_UTIL'] = prep_dados.groupby(['AGENCIA','ANO','MES'])['DIA_UTIL'].cumsum()\n",
-    "    # zera a serie para dias nao uteis\n",
-    "    prep_dados.loc[(prep_dados.DIA_UTIL==1),'SEQ_DIA_UTIL'] = 0\n",
-    "    \n",
-    "    # 14: sequencia dia util negativa\n",
-    "    prep_dados['SEQ_DIA_UTIL_NEG'] = prep_dados.sort_values(['DATA'], ascending=False).groupby(['AGENCIA', 'ANO', 'MES'])['DIA_UTIL'].cumsum()\n",
-    "    # zera a serie para dias nao uteis\n",
-    "    prep_dados.loc[(prep_dados.DIA_UTIL==1), 'SEQ_DIA_UTIL_NEG'] = 0\n",
-    "    \n",
-    "    # 15 - 16: variaveis de quantidade de dias uteis nos proximos (e anteriores) 7 dias\n",
-    "    prep_dados['shift_1'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-1)\n",
-    "    prep_dados['shift_2'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-2)\n",
-    "    prep_dados['shift_3'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-3)\n",
-    "    prep_dados['shift_4'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-4)\n",
-    "    prep_dados['shift_5'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-5)\n",
-    "    prep_dados['shift_6'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-6)\n",
-    "    prep_dados['NUM_DIAS_UTEIS_MAIS_7_DIAS'] = prep_dados[['shift_1', 'shift_2', 'shift_3', 'shift_4', 'shift_5', 'shift_6']].sum(axis=1)\n",
-    "    prep_dados.drop(columns=['shift_1', 'shift_2', 'shift_3', 'shift_4', 'shift_5', 'shift_6'], inplace=True)\n",
-    "    \n",
-    "    prep_dados['NUM_DIAS_UTEIS_MAIS_7_DIAS'].fillna(0, inplace=True)\n",
-    "    prep_dados['NUM_DIAS_UTEIS_MENOS_7_DIAS'].fillna(0, inplace=True)\n",
-    "    prep_dados['NUM_DIAS_UTEIS_MAIS_7_DIAS'] = prep_dados['NUM_DIAS_UTEIS_MAIS_7_DIAS'].astype(int)\n",
-    "    prep_dados['NUM_DIAS_UTEIS_MENOS_7_DIAS'] = prep_dados['NUM_DIAS_UTEIS_MENOS_7_DIAS'].astype(int)\n",
-    "    \n",
-    "    # cria variaveis auxiliares\n",
-    "    prep_dados['DIA_UTIL_LAG'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(1)\n",
-    "    prep_dados['DIA_UTIL_LEAD'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-1)\n",
-    "    \n",
-    "    # 17: variavel de emenda: dia entre dias entre feriados e fds\n",
-    "    prep_dados['EMENDA'] = 0\n",
-    "    prep_dados.loc[((prep_dados.DIA_UTIL_LEAD == 0) & (prep_dados.DIA_UTIL_LAG == 0))&(prep_dados.DIA_UTIL == 1), 'EMENDA'] = 1\n",
-    "    \n",
-    "    # 18: dia adjacente feriado: que nao seja emenda\n",
-    "    prep_dados['DIA_ADJACENTE_FERIADO'] = 0\n",
-    "    prep_dados.loc[((prep_dados.DIA_UTIL_LEAD == 0) | (prep_dados.DIA_UTIL_LAG == 0)) & (prep_dados.DIA_UTIL == 1) & (prep_dados.DIA_SEMANA.isin([3,4,5])), 'DIA_ADJACENTE_FERIADO'] = 1\n",
-    "    \n",
-    "    # cria variavel auxiliar de emenda\n",
-    "    prep_dados['EMENDA_LAG'] = prep_dados.groupby(['AGENCIA'])['EMENDA'].shift(1)\n",
-    "    prep_dados['EMENDA_LEAD'] = prep_dados.groupby(['AGENCIA'])['EMENDA'].shift(-1)\n",
-    "    \n",
-    "    # 19: final de semana de feriado\n",
-    "    # cria a variavel de fds de feriado\n",
-    "    prep_dados['FDS_DE_FERIADO'] = 0\n",
-    "    prep_dados.loc[(((prep_dados.DIA_SEMANA==1)&((prep_dados.EMENDA_LEAD == 1) | (prep_dados.DIA_UTIL_LEAD == 0))) | ((prep_dados.DIA_SEMANA==7)&(prep_dados.EMENDA_LAG == 1) | (prep_dados.DIA_UTIL_LAG == 0))), 'FDS_DE_FERIADO'] = 1\n",
-    "    \n",
-    "    # cria variaveis auxiliares\n",
-    "    prep_dados['FDS_DE_FERIADO_LAG'] = prep_dados.groupby(['AGENCIA'])['FDS_DE_FERIADO'].shift(1)\n",
-    "    prep_dados['FDS_DE_FERIADO_LEAD'] = prep_dados.groupby(['AGENCIA'])['FDS_DE_FERIADO'].shift(-1)\n",
-    "    \n",
-    "    # ajusta a variavel para aparecer tanto no sabado quanto no domingo\n",
-    "    prep_dados.loc[((prep_dados.DIA_SEMANA==1)|((prep_dados.DIA_SEMANA==7))&((prep_dados.FDS_DE_FERIADO == 1) | (prep_dados.FDS_DE_FERIADO_LAG == 1) | (prep_dados.FDS_DE_FERIADO_LEAD == 1)), 'FDS_DE_FERIADO'] = 1\n",
-    "    \n",
-    "    # retira as variaveis auxiliares\n",
-    "    prep_dados.drop(columns = ['DIA_UTIL_LEAD', 'DIA_UTIL_LAG', 'EMENDA_LEAD', 'EMENDA_LAG', 'FDS_DE_FERIADO_LAG', 'FDS_DE_FERIADO_LEAD'], inplace=True)\n",
-    "    \n",
-    "    # 20 - 22: semana quinto dia util e semana anterior e pos\n",
-    "    # coluna aux para segunda feira e faz a soma acumulada para numerar semanas\n",
-    "    prep_dados['SEGUNDA_AUX'] = 0\n",
-    "    prep_dados.loc[(prep_dados.DIA_SEMANA == 2), 'SEGUNDA_AUX'] = 1\n",
-    "    prep_dados['NUM_SEMANA'] = prep_dados.groupby(['AGENCIA']['SEGUNDA_AUX'].cumsum())\n",
-    "    \n",
-    "    # cria base auxiliar com as semanas com o quinto dia util\n",
-    "    semana_5du = prep_dados[prep_dados['SEQ_DIA_UTIL']==5][['AGENCIA', 'NUM_SEMANA']].drop_duplicates()\n",
-    "    semana_5du['SEMANA_QUINTO_DU'] = 1\n",
-    "    semana_5du['NUM_SEMANA_ANTERIOR'] = semana_5du['NUM_SEMANA'] - 1\n",
-    "    semana_5du['SEMANA_ANTERIOR_QUINTO_DU'] = 1\n",
-    "    semana_5du['NUM_SEMANA_APOS'] = semana_5du['NUM_SEMANA'] + 1\n",
-    "    semana_5du['SEMANA_APOS_QUINTO_DU'] = 1\n",
-    "    \n",
-    "    # faz o join\n",
-    "    prep_dados = pd.merge(prep_dados, semana_5du[['AGENCIA', 'NUM_SEMANA', 'SEMANA_QUINTO_DU']], on=['AGENCIA', 'NUM_SEMANA'], how='left')\n",
-    "    \n",
-    "    prep_dados = pd.merge(prep_dados, semana_5du[['AGENCIA', 'NUM_SEMANA_ANTERIOR', 'SEMANA_ANTERIOR_QUINTO_DU']], left_on=['AGENCIA', 'NUM_SEMANA'], right_on=['AGENCIA', 'NUM_SEMANA_ANTERIOR'])\n",
-    "    prep_dados.drop(columns=['CD_MUNICIPIO', 'NUM_SEMANA_ANTERIOR'], inplace=True)\n",
-    "    \n",
-    "    prep_dados = pd.merge(prep_dados, semana_5du[['AGENCIA', 'NUM_SEMANA_APOS', 'SEMANA_APOS_QUINTO_DU']], left_on=['AGENCIA', 'NUM_SEMANA'], right_on=['AGENCIA', 'NUM_SEMANA_APOS'])\n",
-    "    prep_dados.drop(columns=['NUM_SEMANA_APOS'], inplace=True)\n",
-    "    \n",
-    "    # transforma NA em zero\n",
-    "    prep_dados['SEMANA_QUINTO_DU'].fillna(0, inplace=True)\n",
-    "    prep_dados['SEMANA_ANTERIOR_QUINTO_DU'].fillna(0, inplace=True)\n",
-    "    prep_dados['SEMANA_APOS_QUINTO_DU'].fillna(0, inplace=True)\n",
-    "    \n",
-    "    # tira as colunas auxiliares\n",
-    "    prep_dados.drop(columns=['SEGUNDA_AUX', 'NUM_SEMANA'], inplace=True)\n",
-    "    \n",
-    "    # 23: dia mes ajustado\n",
-    "    # dia util anterior recebe os valores do dia do mes dos dias nao uteis seguintes\n",
-    "    # util para casos onde o pagamento é feito pelo dia do mes e é adiantado\n",
-    "    # caso o dia do mes do pagamento caia em um dia nao util\n",
-    "    \n",
-    "    # dia mes ajustado - transfere para o dia\n",
-    "    # sequencia dia util auxiliar\n",
-    "    prep_dados['SEQ_DIA_UTIL_AUX'] = prep_dados.sort_values(['AGENCIA', 'DATA']).groupby(['AGENCIA', 'ANO', 'MES'])['DIA_UTIL'].cumsum()\n",
-    "    \n",
-    "    dia_mes_aux = prep_dados[['AGENCIA', 'ANO', 'MES', 'SEQ_DIA_UTIL_AUX', 'DIA_MES', 'DIA_SEMANA']].rename({'DIA_SEMANA': 'DIA_MES_AJUSTADO'}, axis=1).pivot_table(\n",
-    "        index=['AGENCIA', 'ANO', 'MES', 'SEQ_DIA_UTIL_AUX'],\n",
-    "        columns='DIA_MES',\n",
-    "        values='DIA_MES_AJUSTADO',\n",
-    "        aggfunc='first'\n",
-    "    ).reset_index()\n",
-    "    \n",
-    "    # Renomear colunas DIA_MES para DIA_MES_AJUSTADO_X\n",
-    "    dia_mes_aux.columns = [f'DIA_MES_AJUSTADO_{col}' if isinstance(col, int) else col for col in dia_mes_aux.columns]\n",
-    "    \n",
-    "    # Merge com prep_dados\n",
-    "    prep_dados = pd.merge(prep_dados, dia_mes_aux, on=['AGENCIA', 'ANO', 'MES', 'SEQ_DIA_UTIL_AUX'], how='left')\n",
-    "    \n",
-    "    # Preencher valores faltantes\n",
-    "    cols_dia_mes = [f'DIA_MES_AJUSTADO_{x}' for x in range(1, 32)]\n",
-    "    for col in cols_dia_mes:\n",
-    "        if col in prep_dados.columns:\n",
-    "            prep_dados[col] = prep_dados[col].fillna(0).astype(int)\n",
-    "    \n",
-    "    # Transformar NA em zero e converter para int\n",
-    "    for col in cols_dia_mes:\n",
-    "        if col in prep_dados.columns:\n",
-    "            prep_dados.loc[~prep_dados[col].isna(), col] = 1\n",
-    "            prep_dados.loc[prep_dados[col].isna(), col] = 0\n",
-    "    \n",
-    "    # Zera a serie para dias nao uteis\n",
-    "    prep_dados.loc[prep_dados['DIA_UTIL'] != 1, cols_dia_mes] = 0\n",
-    "    \n",
-    "    return prep_dados"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 4. Implementação do Método Conformal\n",
-    "\n",
-    "Implementamos o detector de drift baseado em método conformal com martingales"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "class DetectorDriftConformal:\n",
-    "    \"\"\"\n",
-    "    Detector de drift usando método conformal com martingales\n",
-    "    \"\"\"\n",
-    "    \n",
-    "    def __init__(self, alpha=0.05, epsilon=0.92, janela_calibracao=90):\n",
-    "        self.alpha = alpha\n",
-    "        self.epsilon = epsilon\n",
-    "        self.janela_calibracao = janela_calibracao\n",
-    "        self.rtol = 1e-5\n",
-    "        self.atol = 1e-5\n",
-    "        self.calibrado = False\n",
-    "        \n",
-    "    def calibrar(self, df_calibracao, variaveis):\n",
-    "        \"\"\"\n",
-    "        Calibra o detector usando período de referência\n",
-    "        \"\"\"\n",
-    "        self.estatisticas = {}\n",
-    "        \n",
-    "        # Calcular estatísticas por variável\n",
-    "        for var in variaveis:\n",
-    "            self.estatisticas[var] = {\n",
-    "                'media': df_calibracao[var].mean(),\n",
-    "                'std': df_calibracao[var].std(),\n",
-    "                'mediana': df_calibracao[var].median(),\n",
-    "                'mad': np.median(np.abs(df_calibracao[var] - df_calibracao[var].median()))\n",
-    "            }\n",
-    "        \n",
-    "        # Calibrar threshold\n",
-    "        self.threshold = self._calibrar_threshold(df_calibracao, variaveis)\n",
-    "        self.calibrado = True\n",
-    "        \n",
-    "        print(f\"Calibração concluída. Threshold: {self.threshold:.2f}\")\n",
-    "        \n",
-    "    def _calibrar_threshold(self, df_cal, variaveis):\n",
-    "        \"\"\"\n",
-    "        Calibra threshold baseado em simulação\n",
-    "        \"\"\"\n",
-    "        # Simular martingales no período estável\n",
-    "        n_simulacoes = 100\n",
-    "        max_martingales = []\n",
-    "        \n",
-    "        for _ in range(n_simulacoes):\n",
-    "            # Simular p-valores uniformes\n",
-    "            p_valores = np.random.uniform(0, 1, len(df_cal))\n",
-    "            martingale = self._calcular_power_martingale(p_valores)\n",
-    "            max_martingales.append(np.max(martingale))\n",
-    "        \n",
-    "        # Threshold = percentil 95\n",
-    "        threshold = np.percentile(max_martingales, 95)\n",
-    "        \n",
-    "        # Garantir threshold mínimo\n",
-    "        threshold_teorico = 1 / self.alpha\n",
-    "        return max(threshold, threshold_teorico * 0.5)\n",
-    "    \n",
-    "    def calcular_score(self, obs, historico, variavel):\n",
-    "        \"\"\"\n",
-    "        Calcula score de não-conformidade\n",
-    "        \"\"\"\n",
-    "        if len(historico) < 10:\n",
-    "            return 0\n",
-    "        \n",
-    "        # Score baseado em desvio robusto\n",
-    "        valores_hist = historico[variavel].values\n",
-    "        mediana = np.median(valores_hist)\n",
-    "        mad = np.median(np.abs(valores_hist - mediana))\n",
-    "        \n",
-    "        if mad > 0:\n",
-    "            score = np.abs(obs[variavel] - mediana) / mad\n",
-    "        else:\n",
-    "            score = np.abs(obs[variavel] - mediana)\n",
-    "            \n",
-    "        return score\n",
-    "    \n",
-    "    def calcular_pvalor(self, score_atual, scores_historicos):\n",
-    "        \"\"\"\n",
-    "        Calcula p-valor conformal\n",
-    "        \"\"\"\n",
-    "        if len(scores_historicos) == 0:\n",
-    "            return 1.0\n",
-    "        \n",
-    "        n = len(scores_historicos)\n",
-    "        n_maiores = np.sum(scores_historicos >= score_atual)\n",
-    "        \n",
-    "        # Tratar empates\n",
-    "        n_empates = np.sum(np.abs(scores_historicos - score_atual) < self.atol)\n",
-    "        if n_empates > 0:\n",
-    "            u = np.random.uniform()\n",
-    "            p_valor = (n_maiores - n_empates + u * n_empates + 1) / (n + 1)\n",
-    "        else:\n",
-    "            p_valor = (n_maiores + 1) / (n + 1)\n",
-    "            \n",
-    "        return max(p_valor, 1e-10)\n",
-    "    \n",
-    "    def _calcular_power_martingale(self, p_valores):\n",
-    "        \"\"\"\n",
-    "        Calcula Power Martingale\n",
-    "        \"\"\"\n",
-    "        martingale = np.zeros(len(p_valores))\n",
-    "        if len(p_valores) == 0:\n",
-    "            return martingale\n",
-    "            \n",
-    "        martingale[0] = self.epsilon * p_valores[0] ** (self.epsilon - 1)\n",
-    "        \n",
-    "        for t in range(1, len(p_valores)):\n",
-    "            martingale[t] = martingale[t-1] * self.epsilon * p_valores[t] ** (self.epsilon - 1)\n",
-    "            \n",
-    "            # Evitar overflow\n",
-    "            if martingale[t] > 1e10:\n",
-    "                martingale[t] = 1e10\n",
-    "            elif martingale[t] < 1e-10:\n",
-    "                martingale[t] = 1e-10\n",
-    "                \n",
-    "        return martingale\n",
-    "    \n",
-    "    def detectar_drift(self, df_monitoramento, variaveis):\n",
-    "        \"\"\"\n",
-    "        Detecta drift no período de monitoramento\n",
-    "        \"\"\"\n",
-    "        if not self.calibrado:\n",
-    "            raise ValueError(\"Detector deve ser calibrado primeiro!\")\n",
-    "        \n",
-    "        resultados = {}\n",
-    "        \n",
-    "        # Para cada variável\n",
-    "        for var in variaveis:\n",
-    "            print(f\"\\nAnalisando {var}...\")\n",
-    "            \n",
-    "            n = len(df_monitoramento)\n",
-    "            scores = np.zeros(n)\n",
-    "            p_valores = np.zeros(n)\n",
-    "            \n",
-    "            # Calcular scores e p-valores\n",
-    "            for i in tqdm(range(n)):\n",
-    "                if i < 30:  # Período inicial\n",
-    "                    scores[i] = 0\n",
-    "                    p_valores[i] = 1.0\n",
-    "                else:\n",
-    "                    # Janela histórica\n",
-    "                    inicio = max(0, i - self.janela_calibracao)\n",
-    "                    historico = df_monitoramento.iloc[inicio:i]\n",
-    "                    \n",
-    "                    # Calcular score\n",
-    "                    obs = df_monitoramento.iloc[i]\n",
-    "                    scores[i] = self.calcular_score(obs, historico, var)\n",
-    "                    \n",
-    "                    # Calcular p-valor\n",
-    "                    scores_hist = scores[inicio:i]\n",
-    "                    p_valores[i] = self.calcular_pvalor(scores[i], scores_hist)\n",
-    "            \n",
-    "            # Calcular martingale\n",
-    "            martingale = np.ones(n)\n",
-    "            if n > 30:\n",
-    "                martingale[30:] = self._calcular_power_martingale(p_valores[30:])\n",
-    "            \n",
-    "            # Detectar drift\n",
-    "            deteccoes = martingale > self.threshold\n",
-    "            \n",
-    "            resultados[var] = {\n",
-    "                'scores': scores,\n",
-    "                'p_valores': p_valores,\n",
-    "                'martingale': martingale,\n",
-    "                'deteccoes': deteccoes,\n",
-    "                'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None\n",
-    "            }\n",
-    "        \n",
-    "        # Análise multivariada\n",
-    "        print(\"\\nAnalisando todas as variáveis em conjunto...\")\n",
-    "        resultados['multivariada'] = self._detectar_drift_multivariado(\n",
-    "            df_monitoramento, variaveis\n",
-    "        )\n",
-    "        \n",
-    "        return resultados\n",
-    "    \n",
-    "    def _detectar_drift_multivariado(self, df, variaveis):\n",
-    "        \"\"\"\n",
-    "        Detecta drift considerando todas as variáveis\n",
-    "        \"\"\"\n",
-    "        n = len(df)\n",
-    "        scores = np.zeros(n)\n",
-    "        p_valores = np.zeros(n)\n",
-    "        \n",
-    "        # Normalizar dados\n",
-    "        scaler = StandardScaler()\n",
-    "        dados_norm = scaler.fit_transform(df[variaveis])\n",
-    "        \n",
-    "        for i in range(n):\n",
-    "            if i < 30:\n",
-    "                scores[i] = 0\n",
-    "                p_valores[i] = 1.0\n",
-    "            else:\n",
-    "                # Score multivariado (distância de Mahalanobis)\n",
-    "                inicio = max(0, i - self.janela_calibracao)\n",
-    "                hist_norm = dados_norm[inicio:i]\n",
-    "                \n",
-    "                # Calcular centróide e covariância\n",
-    "                centro = np.mean(hist_norm, axis=0)\n",
-    "                cov = np.cov(hist_norm.T)\n",
-    "                cov_inv = np.linalg.pinv(cov + np.eye(len(variaveis)) * 1e-6)\n",
-    "                \n",
-    "                # Distância de Mahalanobis\n",
-    "                diff = dados_norm[i] - centro\n",
-    "                scores[i] = np.sqrt(diff @ cov_inv @ diff)\n",
-    "                \n",
-    "                # P-valor\n",
-    "                scores_hist = scores[inicio:i]\n",
-    "                p_valores[i] = self.calcular_pvalor(scores[i], scores_hist)\n",
-    "        \n",
-    "        # Martingale\n",
-    "        martingale = np.ones(n)\n",
-    "        if n > 30:\n",
-    "            martingale[30:] = self._calcular_power_martingale(p_valores[30:])\n",
-    "        \n",
-    "        # Detecções\n",
-    "        deteccoes = martingale > self.threshold\n",
-    "        \n",
-    "        return {\n",
-    "            'scores': scores,\n",
-    "            'p_valores': p_valores,\n",
-    "            'martingale': martingale,\n",
-    "            'deteccoes': deteccoes,\n",
-    "            'primeira_deteccao': np.argmax(deteccoes) if any(deteccoes) else None\n",
-    "        }"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 5. Função Principal de Análise\n",
-    "\n",
-    "Função que executa toda a análise de drift"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "def executar_analise_drift(prep_dados, agencia_id, modo='performance'):\n",
-    "    \"\"\"\n",
-    "    Executa análise completa de drift\n",
-    "    \n",
-    "    Args:\n",
-    "        prep_dados: DataFrame com os dados\n",
-    "        agencia_id: ID da agência para análise\n",
-    "        modo: 'performance' (por DATA_PREVISAO) ou 'inferencia' (por DATA)\n",
-    "    \"\"\"\n",
-    "    print(f\"\\n=== ANÁLISE DE DRIFT - AGÊNCIA {agencia_id} ===\")\n",
-    "    print(f\"Modo: {modo}\")\n",
-    "    \n",
-    "    # Filtrar agência\n",
-    "    df_agencia = prep_dados[prep_dados['AGENCIA'] == agencia_id].copy()\n",
-    "    \n",
-    "    # Ordenar por data apropriada\n",
-    "    if modo == 'performance':\n",
-    "        df_agencia = df_agencia.sort_values('DATA_PREVISAO').reset_index(drop=True)\n",
-    "        data_col = 'DATA_PREVISAO'\n",
-    "    else:\n",
-    "        df_agencia = df_agencia.sort_values('DATA').reset_index(drop=True)\n",
-    "        data_col = 'DATA'\n",
-    "    \n",
-    "    print(f\"\\nPeríodo: {df_agencia[data_col].min()} a {df_agencia[data_col].max()}\")\n",
-    "    print(f\"Total de observações: {len(df_agencia)}\")\n",
-    "    \n",
-    "    # Separar períodos\n",
-    "    data_corte = df_agencia[data_col].min() + pd.DateOffset(months=6)\n",
-    "    \n",
-    "    df_calibracao = df_agencia[df_agencia[data_col] < data_corte]\n",
-    "    df_monitoramento = df_agencia[df_agencia[data_col] >= data_corte]\n",
-    "    \n",
-    "    print(f\"\\nCalibração: {len(df_calibracao)} obs\")\n",
-    "    print(f\"Monitoramento: {len(df_monitoramento)} obs\")\n",
-    "    \n",
-    "    # Criar detector\n",
-    "    detector = DetectorDriftConformal(alpha=0.05, epsilon=0.92)\n",
-    "    \n",
-    "    # Calibrar\n",
-    "    variaveis = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']\n",
-    "    detector.calibrar(df_calibracao, variaveis)\n",
-    "    \n",
-    "    # Detectar drift\n",
-    "    resultados = detector.detectar_drift(df_monitoramento, variaveis)\n",
-    "    \n",
-    "    # Adicionar informações temporais\n",
-    "    resultados['info'] = {\n",
-    "        'datas': df_monitoramento[data_col],\n",
-    "        'data_pandemia': pd.to_datetime('2020-03-01'),\n",
-    "        'threshold': detector.threshold\n",
-    "    }\n",
-    "    \n",
-    "    return resultados, df_monitoramento"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 6. Visualizações\n",
-    "\n",
-    "Funções para criar visualizações dos resultados"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "def plotar_resultado_variavel(resultado, variavel, df_monitoramento):\n",
-    "    \"\"\"\n",
-    "    Plota resultado para uma variável específica\n",
-    "    \"\"\"\n",
-    "    fig, axes = plt.subplots(4, 1, figsize=(15, 12), sharex=True)\n",
-    "    \n",
-    "    datas = resultado['info']['datas']\n",
-    "    data_pandemia = resultado['info']['data_pandemia']\n",
-    "    res_var = resultado[variavel]\n",
-    "    \n",
-    "    # 1. Série temporal\n",
-    "    ax1 = axes[0]\n",
-    "    ax1.plot(datas, df_monitoramento[variavel], 'b-', alpha=0.7)\n",
-    "    ax1.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5, label='Pandemia')\n",
-    "    ax1.set_title(f'Série Temporal - {variavel}')\n",
-    "    ax1.set_ylabel('Valor')\n",
-    "    ax1.legend()\n",
-    "    ax1.grid(True, alpha=0.3)\n",
-    "    \n",
-    "    # 2. Scores\n",
-    "    ax2 = axes[1]\n",
-    "    ax2.plot(datas, res_var['scores'], 'orange', alpha=0.7)\n",
-    "    ax2.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5)\n",
-    "    ax2.set_title('Scores de Não-Conformidade')\n",
-    "    ax2.set_ylabel('Score')\n",
-    "    ax2.grid(True, alpha=0.3)\n",
-    "    \n",
-    "    # 3. P-valores\n",
-    "    ax3 = axes[2]\n",
-    "    ax3.plot(datas, res_var['p_valores'], 'green', alpha=0.7)\n",
-    "    ax3.axhline(0.05, color='red', linestyle=':', label='α=0.05')\n",
-    "    ax3.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5)\n",
-    "    ax3.set_title('P-valores')\n",
-    "    ax3.set_ylabel('P-valor')\n",
-    "    ax3.set_ylim(0, 1.1)\n",
-    "    ax3.legend()\n",
-    "    ax3.grid(True, alpha=0.3)\n",
-    "    \n",
-    "    # 4. Martingale\n",
-    "    ax4 = axes[3]\n",
-    "    ax4.semilogy(datas, res_var['martingale'], 'purple', linewidth=2)\n",
-    "    ax4.axhline(resultado['info']['threshold'], color='red', linestyle='--', \n",
-    "                label=f'Threshold={resultado[\"info\"][\"threshold\"]:.1f}')\n",
-    "    ax4.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5)\n",
-    "    \n",
-    "    # Marcar detecções\n",
-    "    if res_var['primeira_deteccao'] is not None:\n",
-    "        idx = res_var['primeira_deteccao']\n",
-    "        ax4.scatter(datas.iloc[idx], res_var['martingale'][idx], \n",
-    "                   color='red', s=100, marker='v', label='Drift detectado')\n",
-    "    \n",
-    "    ax4.set_title('Power Martingale')\n",
-    "    ax4.set_xlabel('Data')\n",
-    "    ax4.set_ylabel('Martingale (log)')\n",
-    "    ax4.legend()\n",
-    "    ax4.grid(True, alpha=0.3)\n",
-    "    \n",
-    "    plt.tight_layout()\n",
-    "    return fig\n",
-    "\n",
-    "def criar_tabela_resumo(resultados):\n",
-    "    \"\"\"\n",
-    "    Cria tabela resumo dos resultados\n",
-    "    \"\"\"\n",
-    "    data_pandemia = resultados['info']['data_pandemia']\n",
-    "    \n",
-    "    resumo = []\n",
-    "    for var in ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI', 'multivariada']:\n",
-    "        res = resultados[var]\n",
-    "        \n",
-    "        if res['primeira_deteccao'] is not None:\n",
-    "            idx = res['primeira_deteccao']\n",
-    "            data_det = resultados['info']['datas'].iloc[idx]\n",
-    "            dias_apos = (data_det - data_pandemia).days\n",
-    "        else:\n",
-    "            data_det = None\n",
-    "            dias_apos = None\n",
-    "        \n",
-    "        # Estatísticas dos p-valores\n",
-    "        p_valores = res['p_valores']\n",
-    "        idx_pandemia = (resultados['info']['datas'] >= data_pandemia).argmax()\n",
-    "        \n",
-    "        resumo.append({\n",
-    "            'Variável': var,\n",
-    "            'Drift Detectado': 'Sim' if res['primeira_deteccao'] is not None else 'Não',\n",
-    "            'Data Detecção': data_det.strftime('%Y-%m-%d') if data_det else '-',\n",
-    "            'Dias após Pandemia': dias_apos if dias_apos else '-',\n",
-    "            'P-valor médio pré': np.mean(p_valores[:idx_pandemia]),\n",
-    "            'P-valor médio pós': np.mean(p_valores[idx_pandemia:])\n",
-    "        })\n",
-    "    \n",
-    "    return pd.DataFrame(resumo)"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 7. Execução da Análise\n",
-    "\n",
-    "Execute as células abaixo para realizar a análise completa"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Exemplo de execução\n",
-    "# Substitua pelos seus dados reais\n",
-    "\n",
-    "# 1. Carregar dados\n",
-    "# prep_dados = carregar_dados_numerarios('seu_arquivo.csv')\n",
-    "\n",
-    "# 2. Criar features de calendário\n",
-    "# prep_dados = criarVariaveis(prep_dados)\n",
-    "\n",
-    "# 3. Executar análise para uma agência\n",
-    "# agencia_id = prep_dados['AGENCIA'].iloc[0]\n",
-    "# resultados, df_monitoramento = executar_analise_drift(prep_dados, agencia_id, modo='performance')\n",
-    "\n",
-    "# 4. Visualizar resultados\n",
-    "# for var in ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']:\n",
-    "#     fig = plotar_resultado_variavel(resultados, var, df_monitoramento)\n",
-    "#     plt.show()\n",
-    "\n",
-    "# 5. Tabela resumo\n",
-    "# df_resumo = criar_tabela_resumo(resultados)\n",
-    "# print(\"\\n=== RESUMO DOS RESULTADOS ===\")\n",
-    "# print(df_resumo)"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 8. Teste com Diferentes Parâmetros\n",
-    "\n",
-    "Teste o detector com diferentes valores de alpha e epsilon"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "def testar_parametros(prep_dados, agencia_id, alphas=[0.01, 0.05, 0.1], \n",
-    "                     epsilons=[0.7, 0.85, 0.92, 0.95]):\n",
-    "    \"\"\"\n",
-    "    Testa diferentes combinações de parâmetros\n",
-    "    \"\"\"\n",
-    "    resultados_teste = []\n",
-    "    \n",
-    "    # Preparar dados\n",
-    "    df_agencia = prep_dados[prep_dados['AGENCIA'] == agencia_id].copy()\n",
-    "    df_agencia = df_agencia.sort_values('DATA_PREVISAO').reset_index(drop=True)\n",
-    "    \n",
-    "    # Separar períodos\n",
-    "    data_corte = df_agencia['DATA_PREVISAO'].min() + pd.DateOffset(months=6)\n",
-    "    df_calibracao = df_agencia[df_agencia['DATA_PREVISAO'] < data_corte]\n",
-    "    df_monitoramento = df_agencia[df_agencia['DATA_PREVISAO'] >= data_corte]\n",
-    "    \n",
-    "    variaveis = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']\n",
-    "    data_pandemia = pd.to_datetime('2020-03-01')\n",
-    "    \n",
-    "    # Testar cada combinação\n",
-    "    for alpha in alphas:\n",
-    "        for epsilon in epsilons:\n",
-    "            print(f\"\\nTestando α={alpha}, ε={epsilon}...\")\n",
-    "            \n",
-    "            # Criar e calibrar detector\n",
-    "            detector = DetectorDriftConformal(alpha=alpha, epsilon=epsilon)\n",
-    "            detector.calibrar(df_calibracao, variaveis)\n",
-    "            \n",
-    "            # Detectar drift\n",
-    "            resultados = detector.detectar_drift(df_monitoramento, variaveis)\n",
-    "            \n",
-    "            # Análise multivariada\n",
-    "            res_multi = resultados['multivariada']\n",
-    "            \n",
-    "            # Calcular métricas\n",
-    "            if res_multi['primeira_deteccao'] is not None:\n",
-    "                idx = res_multi['primeira_deteccao']\n",
-    "                data_det = df_monitoramento['DATA_PREVISAO'].iloc[idx]\n",
-    "                dias_apos = (data_det - data_pandemia).days\n",
-    "            else:\n",
-    "                dias_apos = np.inf\n",
-    "            \n",
-    "            # Falsos positivos (detecções antes da pandemia)\n",
-    "            idx_pandemia = (df_monitoramento['DATA_PREVISAO'] >= data_pandemia).argmax()\n",
-    "            falsos_pos = sum(res_multi['deteccoes'][:idx_pandemia])\n",
-    "            \n",
-    "            resultados_teste.append({\n",
-    "                'Alpha': alpha,\n",
-    "                'Epsilon': epsilon,\n",
-    "                'Threshold': detector.threshold,\n",
-    "                'Dias até Detecção': dias_apos,\n",
-    "                'Falsos Positivos': falsos_pos,\n",
-    "                'Taxa Detecção (%)': sum(res_multi['deteccoes']) / len(res_multi['deteccoes']) * 100\n",
-    "            })\n",
-    "    \n",
-    "    return pd.DataFrame(resultados_teste)\n",
-    "\n",
-    "# Exemplo de uso:\n",
-    "# df_testes = testar_parametros(prep_dados, agencia_id)\n",
-    "# print(df_testes.sort_values('Dias até Detecção'))"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## 9. Conclusões e Recomendações\n",
-    "\n",
-    "### Interpretação dos Resultados\n",
-    "\n",
-    "1. **Martingale crescente**: Indica evidência acumulada de mudança\n",
-    "2. **P-valores baixos**: Sugerem observações não-conformes com o histórico\n",
-    "3. **Primeira detecção**: Momento em que o sistema identifica drift significativo\n",
-    "\n",
-    "### Recomendações para Produção\n",
-    "\n",
-    "1. **Monitoramento contínuo**: Executar diariamente após novas previsões\n",
-    "2. **Alertas**: Configurar notificações quando martingale > threshold\n",
-    "3. **Retreino**: Considerar retreino do modelo quando drift é detectado\n",
-    "4. **Validação**: Confirmar drift com análise de performance real\n",
-    "\n",
-    "### Próximos Passos\n",
-    "\n",
-    "1. Integrar com pipeline de produção\n",
-    "2. Criar dashboard de monitoramento\n",
-    "3. Automatizar processo de retreino\n",
-    "4. Expandir para outras agências"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.8.0"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 4
-}
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Framework AutoMLOps - Detecção de Drift para Numerários
+Versão simplificada com features reais do projeto
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# 1. FUNÇÕES DE CRIAÇÃO DE FEATURES (EXATAMENTE COMO NO NUMERÁRIOS)
+# =============================================================================
+
+def criarVariaveis(prep_dados):
+    """
+    Cria todas as features de calendário usadas no modelo Numerários
+    """
+    print("Criando features de calendário...")
+    
+    # 1-8: Gera as variáveis mais básicas do calendário
+    prep_dados['DIA_SEMANA'] = prep_dados['DATA'].apply(lambda x: int(x.weekday())+2 if int(x.weekday())+2!=8 else 1)
+    prep_dados['MES'] = prep_dados['DATA'].apply(lambda x: x.month)
+    prep_dados['DIA_MES'] = prep_dados['DATA'].apply(lambda x: x.day)
+    prep_dados['SEMANA_MES'] = prep_dados['DATA'].apply(lambda x: math.ceil((x.day)/7))
+    prep_dados['DIA_FERIADO'] = prep_dados['FERIADO'].apply(lambda x: 0 if np.isnan(x) else 1)
+    prep_dados['DIA_UTIL'] = 0
+    prep_dados.loc[(prep_dados['DIA_SEMANA']>=2)&(prep_dados['DIA_SEMANA']<=6)&(prep_dados['DIA_FERIADO']==0), 'DIA_UTIL'] = 1
+    prep_dados.loc[(prep_dados['DIA_SEMANA']>=2)&(prep_dados['DIA_SEMANA']<=6)&(prep_dados['DIA_FERIADO']==1), 'DIA_FERIADO_UTIL'] = 1
+    
+    # 9: quantidade de dias fechado depois
+    # ordena as datas decrescentes e faz uma contagem enquanto for dia nao util
+    prep_dados['switch'] = (prep_dados['DIA_UTIL'].shift(1) != prep_dados['DIA_UTIL']).astype(int)
+    prep_dados['DIA_UTIL_GROUPS'] = prep_dados.groupby('AGENCIA')['switch'].cumsum()
+    
+    prep_dados['QTD_DIAS_FECHADO_DEPOIS_LEG'] = prep_dados.sort_values(['DATA'], ascending=False).groupby(['AGENCIA', 'DIA_UTIL_GROUPS']).cumcount() + 1
+    prep_dados = prep_dados.drop(columns=['switch', 'DIA_UTIL_GROUPS'])
+    
+    # desloca a serie para colocar na linha correta a quantidade de dias fechados depois
+    prep_dados['QTD_DIAS_FECHADO_ANTES'] = prep_dados.groupby(['AGENCIA'])['QTD_DIAS_FECHADO_DEPOIS_LEG'].shift(-1).fillna(0)
+    prep_dados['QTD_DIAS_FECHADO_DEPOIS'] = prep_dados['QTD_DIAS_FECHADO_ANTES'].astype(int)
+    
+    # zera a serie para os outros dias
+    prep_dados.loc[(prep_dados.DIA_UTIL != 1) | (prep_dados.QTD_DIAS_FECHADO_DEPOIS_LEG != 1), 'QTD_DIAS_FECHADO_DEPOIS'] = 0
+    
+    # 10: quantidade de dias fechado antes
+    # ordena as datas crescentes e faz uma contagem enquanto for dia nao util
+    prep_dados['switch'] = (prep_dados['DIA_UTIL'].shift(1) != prep_dados['DIA_UTIL']).astype(int)
+    prep_dados['DIA_UTIL_GROUPS'] = prep_dados.groupby('AGENCIA')['switch'].cumsum()
+    
+    prep_dados['QTD_DIAS_FECHADO_ANTES_LEG'] = prep_dados.sort_values(['DATA'], ascending=True).groupby(['AGENCIA', 'DIA_UTIL_GROUPS']).cumcount() + 1
+    prep_dados = prep_dados.drop(columns=['switch', 'DIA_UTIL_GROUPS'])
+    
+    # desloca a serie para colocar na linha correta a quantidade de dias fechados depois
+    prep_dados['QTD_DIAS_FECHADO_ANTES']=prep_dados.groupby(['AGENCIA'])['QTD_DIAS_FECHADO_ANTES_LEG'].shift(1).fillna(0)
+    prep_dados['QTD_DIAS_FECHADO_ANTES'] = prep_dados['QTD_DIAS_FECHADO_ANTES'].astype(int)
+    
+    # zera a serie para os outros dias
+    prep_dados.loc[(prep_dados.DIA_UTIL != 1)| (prep_dados.QTD_DIAS_FECHADO_ANTES_LEG != 1), 'QTD_DIAS_FECHADO_ANTES'] = 0
+    
+    # apaga as series auxiliares criadas
+    prep_dados.drop(columns = ["QTD_DIAS_FECHADO_ANTES_LEG", "QTD_DIAS_FECHADO_DEPOIS_LEG"], inplace=True)
+    
+    # 11 - 12: copia as series para representacao numerica da variavel
+    prep_dados['QTD_DIAS_FECHADO_DEPOIS_NUM'] = prep_dados['QTD_DIAS_FECHADO_DEPOIS']
+    prep_dados['QTD_DIAS_FECHADO_ANTES_NUM'] = prep_dados['QTD_DIAS_FECHADO_ANTES']
+    
+    # obs: para essas series as datas precisam comecar e
+    # terminar no primeiro e no ultimo dia do mes respectivamente
+    
+    # 13: sequencia dia util positiva
+    prep_dados['SEQ_DIA_UTIL'] = prep_dados.groupby(['AGENCIA','ANO','MES'])['DIA_UTIL'].cumsum()
+    # zera a serie para dias nao uteis
+    prep_dados.loc[(prep_dados.DIA_UTIL!=1), 'SEQ_DIA_UTIL'] = 0
+    
+    # 14: sequencia dia util negativa
+    prep_dados['SEQ_DIA_UTIL_NEG'] = prep_dados.sort_values(['DATA'], ascending=False).groupby(['AGENCIA','ANO','MES'])['DIA_UTIL'].cumsum()
+    # zera a serie para dias nao uteis
+    prep_dados.loc[(prep_dados.DIA_UTIL!=1), 'SEQ_DIA_UTIL_NEG'] = 0
+    
+    # 15 - 16: variaveis de quantidade de dias uteis nos proximos (e anteriores) 7 dias
+    prep_dados['shift_1'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-1)
+    prep_dados['shift_2'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-2)
+    prep_dados['shift_3'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-3)
+    prep_dados['shift_4'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-4)
+    prep_dados['shift_5'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-5)
+    prep_dados['shift_6'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-6)
+    prep_dados['NUM_DIAS_UTEIS_MAIS_7_DIAS'] = prep_dados['shift_1'] + prep_dados['shift_2'] + prep_dados['shift_3'] + prep_dados['shift_4'] + prep_dados['shift_5'] + prep_dados['shift_6']
+    prep_dados.drop(columns=['shift_1', 'shift_2', 'shift_3', 'shift_4', 'shift_5', 'shift_6'], inplace=True)
+    
+    prep_dados['shift_1'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(1)
+    prep_dados['shift_2'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(2)
+    prep_dados['shift_3'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(3)
+    prep_dados['shift_4'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(4)
+    prep_dados['shift_5'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(5)
+    prep_dados['shift_6'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(6)
+    prep_dados['NUM_DIAS_UTEIS_MENOS_7_DIAS'] = prep_dados['shift_1'] + prep_dados['shift_2'] + prep_dados['shift_3'] + prep_dados['shift_4'] + prep_dados['shift_5'] + prep_dados['shift_6']
+    prep_dados.drop(columns=['shift_1', 'shift_2', 'shift_3', 'shift_4', 'shift_5', 'shift_6'], inplace=True)
+    
+    prep_dados['NUM_DIAS_UTEIS_MAIS_7_DIAS'].fillna(0, inplace=True)
+    prep_dados['NUM_DIAS_UTEIS_MENOS_7_DIAS'].fillna(0, inplace=True)
+    prep_dados['NUM_DIAS_UTEIS_MAIS_7_DIAS'] = prep_dados.drop(columns=['NUM_DIAS_UTEIS_MAIS_7_DIAS']).astype(int)
+    prep_dados['NUM_DIAS_UTEIS_MENOS_7_DIAS'] = prep_dados['NUM_DIAS_UTEIS_MENOS_7_DIAS'].astype(int)
+    
+    # cria variaveis auxiliares
+    prep_dados['DIA_UTIL_LAG'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(1)
+    prep_dados['DIA_UTIL_LEAD'] = prep_dados.groupby(['AGENCIA'])['DIA_UTIL'].shift(-1)
+    
+    # 17: variavel de emenda: dia entre dias entre feriados e fds
+    prep_dados['EMENDA'] = 0
+    prep_dados.loc[((prep_dados.DIA_UTIL_LEAD == 0) & (prep_dados.DIA_UTIL_LAG == 0) & (prep_dados.DIA_UTIL == 1)), 'EMENDA'] = 1
+    
+    # 18: dia adjacente feriado: que nao seja emenda
+    prep_dados['DIA_ADJACENTE_FERIADO'] = 0
+    prep_dados.loc[(((prep_dados.DIA_UTIL_LEAD == 0) | (prep_dados.DIA_UTIL_LAG == 0)) & (prep_dados.DIA_UTIL == 1) & (prep_dados.DIA_SEMANA.isin([3,4,5]))), 'DIA_ADJACENTE_FERIADO'] = 1
+    
+    # cria variavel auxiliar de emenda
+    prep_dados['EMENDA_LAG'] = prep_dados.groupby(['AGENCIA'])['EMENDA'].shift(1)
+    prep_dados['EMENDA_LEAD'] = prep_dados.groupby(['AGENCIA'])['EMENDA'].shift(-1)
+    
+    # 19: finais de semana de feriado
+    # cria a variavel de fds de feriado
+    prep_dados['FDS_DE_FERIADO'] = 0
+    prep_dados.loc[(((prep_dados.DIA_SEMANA==1)&((prep_dados.EMENDA_LEAD == 1) | (prep_dados.DIA_UTIL_LEAD == 0))) | 
+                    ((prep_dados.DIA_SEMANA==7)&((prep_dados.EMENDA_LAG == 1) | (prep_dados.DIA_UTIL_LAG == 0)))), 'FDS_DE_FERIADO'] = 1
+    
+    # ajusta a variavel para aparecer tanto no sabado quanto no domingo
+    prep_dados.loc[((prep_dados.DIA_SEMANA==1) | (prep_dados.DIA_SEMANA==7)) & ((prep_dados.FDS_DE_FERIADO == 1) | (prep_dados.FDS_DE_FERIADO_LAG == 1) | (prep_dados.FDS_DE_FERIADO_LEAD == 1)), 'FDS_DE_FERIADO'] = 1
+    
+    # retira as variaveis auxiliares
+    prep_dados.drop(columns = ['DIA_UTIL_LEAD', 'DIA_UTIL_LAG', 'EMENDA_LEAD', 'EMENDA_LAG', 'FDS_DE_FERIADO_LAG', 'FDS_DE_FERIADO_LEAD'], inplace=True)
+    
+    # 20 - 22: semana quinto dia util e semana anterior e apos
+    # coluna aux para segunda feira e faz a soma acumulada para numerar semanas
+    prep_dados['SEGUNDA_AUX'] = 0
+    prep_dados.loc[(prep_dados.DIA_SEMANA == 2), 'SEGUNDA_AUX'] = 1
+    prep_dados['NUM_SEMANA'] = prep_dados.groupby(['AGENCIA'])['SEGUNDA_AUX'].cumsum()
+    
+    # cria base auxiliar com as semanas com o quinto dia util
+    semana_5du = prep_dados[prep_dados['SEQ_DIA_UTIL']==5][['AGENCIA','NUM_SEMANA']].drop_duplicates()
+    semana_5du['SEMANA_QUINTO_DU'] = 1
+    semana_5du['NUM_SEMANA_ANTERIOR'] = semana_5du['NUM_SEMANA'] - 1
+    semana_5du['NUM_SEMANA_APOS'] = semana_5du['NUM_SEMANA'] + 1
+    
+    # faz o join
+    prep_dados = pd.merge(prep_dados, semana_5du[['AGENCIA', 'NUM_SEMANA', 'SEMANA_QUINTO_DU']], on=['AGENCIA','NUM_SEMANA'], how='left')
+    
+    prep_dados = pd.merge(prep_dados, semana_5du[['AGENCIA', 'NUM_SEMANA_ANTERIOR', 'SEMANA_ANTERIOR_QUINTO_DU']], left_on=['AGENCIA','NUM_SEMANA'], right_on=['AGENCIA','NUM_SEMANA_ANTERIOR'], how='left')
+    prep_dados.drop(columns=['CO_MUNICIPIO','NUM_SEMANA_ANTERIOR'], inplace=True)
+    
+    prep_dados = pd.merge(prep_dados, semana_5du[['AGENCIA', 'NUM_SEMANA_APOS', 'SEMANA_APOS_QUINTO_DU']], left_on=['AGENCIA','NUM_SEMANA'], right_on=['AGENCIA','NUM_SEMANA_APOS'], how='left')
+    prep_dados.drop(columns=['NUM_SEMANA_APOS'], inplace=True)
+    
+    # transforma NA em zero
+    prep_dados['SEMANA_QUINTO_DU'].fillna(0, inplace=True)
+    prep_dados['SEMANA_ANTERIOR_QUINTO_DU'].fillna(0, inplace=True)
+    prep_dados['SEMANA_APOS_QUINTO_DU'].fillna(0, inplace=True)
+    
+    # tira as colunas auxiliares
+    prep_dados.drop(columns = ['SEGUNDA_AUX', 'NUM_SEMANA'], inplace=True)
+    
+    # 23: dia mes ajustado
+    # dia util anterior recebe os valores do dia do mes dos dias nao uteis seguintes
+    # util para casos onde o pagamento é feito pelo dia do mes e é adiantado
+    # caso o dia do mes do pagamento caia em um dia nao util
+    
+    # dia mes ajustado - transfere para o dia
+    # sequencia dia util auxiliar
+    prep_dados['SEQ_DIA_UTIL_AUX'] = prep_dados.sort_values(['AGENCIA','DATA']).groupby(['AGENCIA','ANO','MES'])['DIA_UTIL'].cumsum()
+    
+    dia_mes_aux = prep_dados[['AGENCIA','ANO','MES','SEQ_DIA_UTIL_AUX','DIA_MES','DIA_SEMANA']].rename({'DIA_SEMANA':'DIA_MES_AJUSTADO'}, axis=1).pivot_table(index=['AGENCIA','ANO','MES','SEQ_DIA_UTIL_AUX'], columns='DIA_MES', values='DIA_MES_AJUSTADO')
+    dia_mes_aux.columns = [str(dia_mes_aux.columns.droplevel(0)[i]) + '_' + str(dia_mes_aux.columns.droplevel(0)[i]) for i in range(0,32)]
+    dia_mes_aux.rename({'AGENCIA_':'AGENCIA', 'ANO_':'ANO', 'MES_':'MES', 'SEQ_DIA_UTIL_AUX_':'SEQ_DIA_UTIL_AUX'}, axis=1, inplace=True)
+    
+    for i in range(1,32):
+        dia_mes_aux.loc[~np.isnan(dia_mes_aux['DIA_MES_AJUSTADO_'+str(i)]), 'DIA_MES_AJUSTADO_'+str(i)] = i
+    
+    prep_dados = pd.merge(prep_dados, dia_mes_aux, on=['AGENCIA','ANO','MES','SEQ_DIA_UTIL_AUX'], how='left')
+    
+    cols_dia_mes = ['DIA_MES_AJUSTADO_'+str(x) for x in range(1,32)]
+    
+    # transforma NA em zero para outros valores em 1
+    for col in cols_dia_mes:
+        prep_dados.loc[~np.isnan(prep_dados[col]), col] = 1
+        prep_dados.loc[np.isnan(prep_dados[col]), col] = 0
+    
+    # zera a serie para dias nao uteis
+    prep_dados.loc[prep_dados['DIA_UTIL']!=1, cols_dia_mes] = 0
+    
+    return prep_dados
+
+# =============================================================================
+# 2. CLASSE SIMPLIFICADA DO DETECTOR CONFORMAL
+# =============================================================================
+
+class DetectorConformalSimples:
+    """
+    Detector conformal simplificado para Numerários
+    """
+    
+    def __init__(self, alpha=0.05, epsilon=0.92):
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.threshold = 1 / alpha
+        self.janela_calibracao = 90  # 3 meses
+        
+    def calcular_score(self, valor_atual, historico, tipo_contexto=None):
+        """
+        Calcula score de não-conformidade
+        """
+        if len(historico) < 5:
+            return 0
+            
+        # Estatísticas robustas
+        mediana = np.median(historico)
+        mad = np.median(np.abs(historico - mediana))
+        
+        if mad > 0:
+            score = np.abs(valor_atual - mediana) / mad
+        else:
+            std = np.std(historico)
+            score = np.abs(valor_atual - mediana) / (std + 1e-8)
+            
+        return score
+    
+    def calcular_pvalor(self, score_atual, scores_historicos):
+        """
+        Calcula p-valor conformal
+        """
+        if len(scores_historicos) == 0:
+            return 1.0
+            
+        n = len(scores_historicos)
+        n_maiores = np.sum(scores_historicos >= score_atual)
+        
+        # Tratar empates
+        n_empates = np.sum(np.abs(scores_historicos - score_atual) < 1e-8)
+        if n_empates > 0:
+            u = np.random.uniform()
+            p_valor = (n_maiores - n_empates + u * n_empates + 1) / (n + 1)
+        else:
+            p_valor = (n_maiores + 1) / (n + 1)
+            
+        return max(p_valor, 1e-10)
+    
+    def power_martingale(self, p_valores):
+        """
+        Calcula Power Martingale
+        """
+        if len(p_valores) == 0:
+            return np.array([])
+            
+        martingale = np.zeros(len(p_valores))
+        martingale[0] = self.epsilon * p_valores[0] ** (self.epsilon - 1)
+        
+        for t in range(1, len(p_valores)):
+            incremento = self.epsilon * p_valores[t] ** (self.epsilon - 1)
+            martingale[t] = martingale[t-1] * incremento
+            
+            # Evitar overflow/underflow
+            if martingale[t] > 1e10:
+                martingale[t] = 1e10
+            elif martingale[t] < 1e-10:
+                martingale[t] = 1e-10
+                
+        return martingale
+    
+    def detectar_drift(self, df, variavel, contexto_col=None):
+        """
+        Detecta drift em uma variável
+        """
+        n = len(df)
+        scores = np.zeros(n)
+        p_valores = np.zeros(n)
+        
+        # Calcular scores
+        for i in range(n):
+            if i < self.janela_calibracao:
+                scores[i] = 0
+                p_valores[i] = 1.0
+            else:
+                # Janela histórica
+                inicio = max(0, i - self.janela_calibracao)
+                
+                # Se tiver contexto, filtrar por tipo similar
+                if contexto_col and contexto_col in df.columns:
+                    contexto_atual = df.iloc[i][contexto_col]
+                    mask_contexto = df.iloc[inicio:i][contexto_col] == contexto_atual
+                    
+                    if mask_contexto.sum() > 10:
+                        historico = df.iloc[inicio:i][mask_contexto][variavel].values
+                    else:
+                        historico = df.iloc[inicio:i][variavel].values
+                else:
+                    historico = df.iloc[inicio:i][variavel].values
+                
+                # Score
+                valor_atual = df.iloc[i][variavel]
+                scores[i] = self.calcular_score(valor_atual, historico)
+                
+                # P-valor
+                scores_hist = scores[inicio:i]
+                p_valores[i] = self.calcular_pvalor(scores[i], scores_hist)
+        
+        # Calcular martingale
+        martingale = np.ones(n)
+        if n > self.janela_calibracao:
+            mart_calc = self.power_martingale(p_valores[self.janela_calibracao:])
+            martingale[self.janela_calibracao:] = mart_calc
+        
+        # Detectar drift
+        deteccoes = martingale > self.threshold
+        
+        return {
+            'scores': scores,
+            'p_valores': p_valores,
+            'martingale': martingale,
+            'deteccoes': deteccoes
+        }
+
+# =============================================================================
+# 3. ANÁLISE PRINCIPAL
+# =============================================================================
+
+def analisar_drift_numerarios(filepath, agencia_id=None):
+    """
+    Função principal de análise
+    """
+    print("=== ANÁLISE DE DRIFT - NUMERÁRIOS ===\n")
+    
+    # 1. Carregar dados
+    print("1. Carregando dados...")
+    df = pd.read_csv(filepath)
+    
+    # Converter datas
+    df['DATA'] = pd.to_datetime(df['DATA'])
+    df['DATA_REFERENCIA'] = pd.to_datetime(df['DATA_REFERENCIA'], errors='coerce')
+    df['DATA_PREVISAO'] = pd.to_datetime(df['DATA_PREVISAO'])
+    
+    # Adicionar colunas necessárias se não existirem
+    if 'ANO' not in df.columns:
+        df['ANO'] = df['DATA'].dt.year
+    
+    # Simular coluna FERIADO se não existir
+    if 'FERIADO' not in df.columns:
+        # Lista de feriados exemplo
+        feriados = pd.to_datetime([
+            '2019-01-01', '2019-04-19', '2019-04-21', '2019-05-01',
+            '2020-01-01', '2020-02-24', '2020-02-25', '2020-04-10',
+            '2020-04-21', '2020-05-01', '2020-06-11', '2020-09-07',
+            '2020-10-12', '2020-11-02', '2020-11-15', '2020-12-25',
+            '2021-01-01', '2021-02-15', '2021-02-16'
+        ])
+        df['FERIADO'] = df['DATA'].apply(lambda x: 1 if x in feriados else np.nan)
+    
+    # Selecionar agência
+    if agencia_id is None:
+        agencia_id = df['AGENCIA'].iloc[0]
+    
+    df_agencia = df[df['AGENCIA'] == agencia_id].copy()
+    df_agencia = df_agencia.sort_values('DATA').reset_index(drop=True)
+    
+    print(f"   Agência: {agencia_id}")
+    print(f"   Período: {df_agencia['DATA'].min()} a {df_agencia['DATA'].max()}")
+    print(f"   Total de observações: {len(df_agencia)}")
+    
+    # 2. Criar features
+    print("\n2. Criando features de calendário...")
+    
+    # Importar math para a função
+    import math
+    df_agencia = criarVariaveis(df_agencia)
+    
+    # 3. Criar detector
+    print("\n3. Configurando detector conformal...")
+    detector = DetectorConformalSimples(alpha=0.05, epsilon=0.92)
+    
+    # 4. Analisar cada variável
+    variaveis = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']
+    resultados = {}
+    
+    print("\n4. Detectando drift...")
+    for var in variaveis:
+        print(f"   - Analisando {var}...")
+        resultados[var] = detector.detectar_drift(df_agencia, var, contexto_col='SEMANA_QUINTO_DU')
+    
+    # 5. Visualizar resultados
+    print("\n5. Gerando visualizações...")
+    visualizar_resultados(df_agencia, resultados, variaveis)
+    
+    # 6. Relatório
+    gerar_relatorio(df_agencia, resultados, variaveis)
+    
+    return df_agencia, resultados
+
+def visualizar_resultados(df, resultados, variaveis):
+    """
+    Cria visualizações dos resultados
+    """
+    # Data da pandemia
+    data_pandemia = pd.to_datetime('2020-03-01')
+    
+    # Criar figura com subplots
+    fig, axes = plt.subplots(len(variaveis), 2, figsize=(18, 4*len(variaveis)))
+    
+    for i, var in enumerate(variaveis):
+        res = resultados[var]
+        
+        # Martingale
+        ax1 = axes[i, 0]
+        ax1.semilogy(df['DATA'], res['martingale'], 'b-', linewidth=2)
+        ax1.axhline(20, color='red', linestyle='--', label='Threshold')
+        ax1.axvline(data_pandemia, color='black', linestyle='--', alpha=0.5, label='Pandemia')
+        
+        # Marcar detecções
+        if any(res['deteccoes']):
+            idx_det = np.where(res['deteccoes'])[0]
+            ax1.scatter(df['DATA'].iloc[idx_det], res['martingale'][idx_det],
+                       color='red', s=100, marker='v', label='Drift')
+        
+        ax1.set_title(f'Martingale - {var}')
+        ax1.set_xlabel('Data')
+        ax1.set_ylabel('Martingale (log)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # P-valores
+        ax2 = axes[i, 1]
+        ax2.plot(df['DATA'], res['p_valores'], 'g-', alpha=0.7)
+        ax2.axhline(0.05, color='red', linestyle=':', label='α=0.05')
+        ax2.axvline(data_pandemia, color='black', linestyle='--', alpha=0.5)
+        ax2.set_title(f'P-valores - {var}')
+        ax2.set_xlabel('Data')
+        ax2.set_ylabel('P-valor')
+        ax2.set_ylim(0, 1.1)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('drift_numerarios_resultados.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+def gerar_relatorio(df, resultados, variaveis):
+    """
+    Gera relatório dos resultados
+    """
+    data_pandemia = pd.to_datetime('2020-03-01')
+    idx_pandemia = (df['DATA'] >= data_pandemia).argmax()
+    
+    print("\n=== RELATÓRIO DE DETECÇÃO DE DRIFT ===\n")
+    
+    for var in variaveis:
+        res = resultados[var]
+        
+        print(f"\n{var}:")
+        
+        # Detecções
+        n_deteccoes = sum(res['deteccoes'])
+        print(f"  Total de detecções: {n_deteccoes}")
+        
+        if any(res['deteccoes']):
+            # Primeira detecção
+            idx_primeira = np.argmax(res['deteccoes'])
+            data_primeira = df['DATA'].iloc[idx_primeira]
+            dias_apos = (data_primeira - data_pandemia).days
+            
+            print(f"  Primeira detecção: {data_primeira.strftime('%Y-%m-%d')}")
+            print(f"  Dias após pandemia: {dias_apos}")
+            
+            # Falsos positivos
+            falsos_pos = sum(res['deteccoes'][:idx_pandemia])
+            print(f"  Falsos positivos (pré-pandemia): {falsos_pos}")
+        else:
+            print("  Nenhum drift detectado")
+        
+        # P-valores médios
+        p_val_pre = np.mean(res['p_valores'][:idx_pandemia])
+        p_val_pos = np.mean(res['p_valores'][idx_pandemia:])
+        print(f"  P-valor médio pré-pandemia: {p_val_pre:.3f}")
+        print(f"  P-valor médio pós-pandemia: {p_val_pos:.3f}")
+
+# =============================================================================
+# 4. ANÁLISE MULTIVARIADA SIMPLES
+# =============================================================================
+
+def analisar_multivariada(df, variaveis=['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']):
+    """
+    Análise multivariada simplificada
+    """
+    detector = DetectorConformalSimples(alpha=0.05, epsilon=0.92)
+    
+    n = len(df)
+    scores_multi = np.zeros(n)
+    p_valores_multi = np.zeros(n)
+    
+    # Para cada observação
+    for i in range(n):
+        if i < detector.janela_calibracao:
+            scores_multi[i] = 0
+            p_valores_multi[i] = 1.0
+        else:
+            # Calcular score multivariado (norma dos scores individuais)
+            scores_vars = []
+            
+            for var in variaveis:
+                inicio = max(0, i - detector.janela_calibracao)
+                historico = df.iloc[inicio:i][var].values
+                valor_atual = df.iloc[i][var]
+                
+                score = detector.calcular_score(valor_atual, historico)
+                scores_vars.append(score)
+            
+            # Score multivariado
+            scores_multi[i] = np.linalg.norm(scores_vars)
+            
+            # P-valor
+            scores_hist = scores_multi[inicio:i]
+            p_valores_multi[i] = detector.calcular_pvalor(scores_multi[i], scores_hist)
+    
+    # Martingale
+    martingale_multi = np.ones(n)
+    if n > detector.janela_calibracao:
+        mart_calc = detector.power_martingale(p_valores_multi[detector.janela_calibracao:])
+        martingale_multi[detector.janela_calibracao:] = mart_calc
+    
+    # Visualizar
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    
+    data_pandemia = pd.to_datetime('2020-03-01')
+    
+    # Martingale
+    ax1.semilogy(df['DATA'], martingale_multi, 'purple', linewidth=2)
+    ax1.axhline(detector.threshold, color='red', linestyle='--', label='Threshold')
+    ax1.axvline(data_pandemia, color='black', linestyle='--', alpha=0.5, label='Pandemia')
+    ax1.set_title('Análise Multivariada - Power Martingale')
+    ax1.set_ylabel('Martingale (log)')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # P-valores
+    ax2.plot(df['DATA'], p_valores_multi, 'green', alpha=0.7)
+    ax2.axhline(0.05, color='red', linestyle=':', label='α=0.05')
+    ax2.axvline(data_pandemia, color='black', linestyle='--', alpha=0.5)
+    ax2.set_title('P-valores Multivariados')
+    ax2.set_xlabel('Data')
+    ax2.set_ylabel('P-valor')
+    ax2.set_ylim(0, 1.1)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('drift_numerarios_multivariada.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return {
+        'scores': scores_multi,
+        'p_valores': p_valores_multi,
+        'martingale': martingale_multi,
+        'deteccoes': martingale_multi > detector.threshold
+    }
+
+# =============================================================================
+# EXEMPLO DE USO
+# =============================================================================
+
+if __name__ == "__main__":
+    # Para executar:
+    # df_agencia, resultados = analisar_drift_numerarios('previsoes_numerario_pre_pos_pandemia.csv')
+    
+    print("\nScript de detecção de drift para Numerários")
+    print("Use: df_agencia, resultados = analisar_drift_numerarios('arquivo.csv', agencia_id)")
