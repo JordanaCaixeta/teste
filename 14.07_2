@@ -1,0 +1,1224 @@
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Framework AutoMLOps - Detecção de Drift com Método Conformal
+Versão completa adaptada para todas as features do Projeto Numerários
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+import warnings
+from itertools import product
+warnings.filterwarnings('ignore')
+
+# Configurações de visualização
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+
+# =============================================================================
+# 1. CARREGAMENTO E PREPARAÇÃO DOS DADOS COM TODAS AS FEATURES
+# =============================================================================
+
+def carregar_dados_numerarios_completo(filepath):
+    """
+    Carrega dados e cria TODAS as features usadas no modelo Numerários
+    """
+    df = pd.read_csv(filepath)
+    
+    # Converter datas
+    df['DATA'] = pd.to_datetime(df['DATA'])  # Data da inferência (data alvo)
+    df['DATA_REFERENCIA'] = pd.to_datetime(df['DATA_REFERENCIA'], errors='coerce')  # Última data de treino
+    df['DATA_PREVISAO'] = pd.to_datetime(df['DATA_PREVISAO'])  # Quando modelo foi executado
+    
+    # Calcular horizonte de previsão
+    df['HORIZONTE_DIAS'] = (df['DATA'] - df['DATA_REFERENCIA']).dt.days
+    
+    # Calcular idade da previsão
+    df['IDADE_PREVISAO'] = (df['DATA'] - df['DATA_PREVISAO']).dt.days
+    
+    # IMPORTANTE: Ordenar por DATA_PREVISAO para análise temporal correta
+    # Queremos ver como o modelo se comporta ao longo do tempo de execução
+    df = df.sort_values(['AGENCIA', 'DATA_PREVISAO', 'DATA']).reset_index(drop=True)
+    
+    print(f"Dados carregados: {len(df)} observações")
+    print(f"Período de execução: {df['DATA_PREVISAO'].min()} a {df['DATA_PREVISAO'].max()}")
+    print(f"Período de inferência: {df['DATA'].min()} a {df['DATA'].max()}")
+    
+    return df
+
+def criar_features_calendario_numerarios(df, usar_data='DATA'):
+    """
+    Cria TODAS as 22+ features de calendário do modelo Numerários
+    
+    Args:
+        df: DataFrame com os dados
+        usar_data: Qual data usar para features ('DATA' ou 'DATA_PREVISAO')
+    """
+    print(f"Criando features de calendário baseadas em {usar_data}...")
+    
+    # Permitir escolher qual data usar para as features
+    data_base = df[usar_data]
+    
+    # 1. DIA_SEMANA
+    df['DIA_SEMANA'] = data_base.dt.dayofweek + 1  # 1=domingo até 7=sábado
+    
+    # 2. MES
+    df['MES'] = df['DATA'].dt.month
+    
+    # 3. DIA_MES
+    df['DIA_MES'] = df['DATA'].dt.day
+    
+    # 4. SEMANA_MES
+    df['SEMANA_MES'] = ((df['DIA_MES'] - 1) // 7) + 1
+    
+    # 5. DIA_UTIL (segunda a sexta, não feriado)
+    df['DIA_UTIL'] = ((df['DIA_SEMANA'].between(2, 6)) & (~df.get('DIA_FERIADO', False))).astype(int)
+    
+    # Simular feriados para exemplo (em produção usar base real)
+    feriados_exemplo = [
+        '2019-01-01', '2019-04-19', '2019-04-21', '2019-05-01', '2019-06-20',
+        '2019-09-07', '2019-10-12', '2019-11-02', '2019-11-15', '2019-12-25',
+        '2020-01-01', '2020-02-24', '2020-02-25', '2020-04-10', '2020-04-21',
+        '2020-05-01', '2020-06-11', '2020-09-07', '2020-10-12', '2020-11-02',
+        '2020-11-15', '2020-12-25', '2021-01-01', '2021-02-15', '2021-02-16'
+    ]
+    feriados = pd.to_datetime(feriados_exemplo)
+    
+    # 6. DIA_FERIADO
+    df['DIA_FERIADO'] = df['DATA'].isin(feriados).astype(int)
+    
+    # 7. DIA_FERIADO_UTIL (feriado em dia de semana)
+    df['DIA_FERIADO_UTIL'] = ((df['DIA_SEMANA'].between(2, 6)) & (df['DIA_FERIADO'] == 1)).astype(int)
+    
+    # 8-11. QTD_DIAS_FECHADO_DEPOIS/ANTES
+    df['QTD_DIAS_FECHADO_DEPOIS'] = 0
+    df['QTD_DIAS_FECHADO_ANTES'] = 0
+    
+    # Calcular dias fechados (simplificado)
+    for i in range(len(df)):
+        # Dias fechados depois
+        dias_depois = 0
+        j = i + 1
+        while j < len(df) and (df.iloc[j]['DIA_UTIL'] == 0):
+            dias_depois += 1
+            j += 1
+        df.loc[i, 'QTD_DIAS_FECHADO_DEPOIS'] = dias_depois
+        
+        # Dias fechados antes
+        dias_antes = 0
+        j = i - 1
+        while j >= 0 and (df.iloc[j]['DIA_UTIL'] == 0):
+            dias_antes += 1
+            j -= 1
+        df.loc[i, 'QTD_DIAS_FECHADO_ANTES'] = dias_antes
+    
+    df['QTD_DIAS_FECHADO_DEPOIS_NUM'] = df['QTD_DIAS_FECHADO_DEPOIS']
+    df['QTD_DIAS_FECHADO_ANTES_NUM'] = df['QTD_DIAS_FECHADO_ANTES']
+    
+    # 12-13. SEQ_DIA_UTIL / SEQ_DIA_UTIL_NEG
+    df['SEQ_DIA_UTIL'] = 0
+    df['SEQ_DIA_UTIL_NEG'] = 0
+    
+    # Por agência e mês
+    for (agencia, ano_mes), grupo in df.groupby(['AGENCIA', pd.Grouper(key='DATA', freq='M')]):
+        mask_util = grupo['DIA_UTIL'] == 1
+        
+        # Sequência positiva
+        seq_pos = mask_util.cumsum()
+        df.loc[grupo.index[mask_util], 'SEQ_DIA_UTIL'] = seq_pos[mask_util]
+        
+        # Sequência negativa
+        seq_neg = mask_util[::-1].cumsum()[::-1]
+        df.loc[grupo.index[mask_util], 'SEQ_DIA_UTIL_NEG'] = seq_neg[mask_util]
+    
+    # 14-15. NUM_DIAS_UTEIS_MAIS/MENOS_7_DIAS
+    df['NUM_DIAS_UTEIS_MAIS_7_DIAS'] = df['DIA_UTIL'].rolling(window=7, min_periods=1).sum()
+    df['NUM_DIAS_UTEIS_MENOS_7_DIAS'] = df['DIA_UTIL'].rolling(window=7, min_periods=1).sum()
+    
+    # 16. EMENDA (dia útil entre feriado e fim de semana)
+    df['EMENDA'] = 0
+    for i in range(1, len(df)-1):
+        if (df.iloc[i]['DIA_UTIL'] == 1 and 
+            ((df.iloc[i-1]['DIA_FERIADO'] == 1 and df.iloc[i+1]['DIA_SEMANA'] >= 6) or
+             (df.iloc[i+1]['DIA_FERIADO'] == 1 and df.iloc[i-1]['DIA_SEMANA'] >= 6))):
+            df.loc[i, 'EMENDA'] = 1
+    
+    # 17. DIA_ADJACENTE_FERIADO
+    df['DIA_ADJACENTE_FERIADO'] = 0
+    for i in range(len(df)):
+        if df.iloc[i]['DIA_UTIL'] == 1 and df.iloc[i]['EMENDA'] == 0:
+            if ((i > 0 and df.iloc[i-1]['DIA_FERIADO'] == 1) or 
+                (i < len(df)-1 and df.iloc[i+1]['DIA_FERIADO'] == 1)):
+                df.loc[i, 'DIA_ADJACENTE_FERIADO'] = 1
+    
+    # 18. FDS_DE_FERIADO
+    df['FDS_DE_FERIADO'] = 0
+    # Fins de semana adjacentes a feriados
+    
+    # 19-21. SEMANA_QUINTO_DU e relacionados
+    df['SEMANA_QUINTO_DU'] = 0
+    df['SEMANA_ANTERIOR_QUINTO_DU'] = 0
+    df['SEMANA_APOS_QUINTO_DU'] = 0
+    
+    # Identificar quinto dia útil do mês
+    for (agencia, mes), grupo in df.groupby(['AGENCIA', pd.Grouper(key='DATA', freq='M')]):
+        dias_uteis = grupo[grupo['DIA_UTIL'] == 1]
+        if len(dias_uteis) >= 5:
+            quinto_du = dias_uteis.iloc[4]['DATA']
+            semana_quinto = dias_uteis.iloc[4]['SEMANA_MES']
+            
+            # Marcar semanas
+            mask_mes = (df['AGENCIA'] == agencia) & (df['DATA'].dt.to_period('M') == mes)
+            df.loc[mask_mes & (df['SEMANA_MES'] == semana_quinto), 'SEMANA_QUINTO_DU'] = 1
+            if semana_quinto > 1:
+                df.loc[mask_mes & (df['SEMANA_MES'] == semana_quinto - 1), 'SEMANA_ANTERIOR_QUINTO_DU'] = 1
+            if semana_quinto < 5:
+                df.loc[mask_mes & (df['SEMANA_MES'] == semana_quinto + 1), 'SEMANA_APOS_QUINTO_DU'] = 1
+    
+    # 22. DIA_MES_AJUSTADO_1 até DIA_MES_AJUSTADO_31
+    # Criar variáveis dummy para cada dia útil do mês
+    for dia in range(1, 32):
+        df[f'DIA_MES_AJUSTADO_{dia}'] = 0
+    
+    # Por mês, marcar o n-ésimo dia útil
+    for (agencia, mes), grupo in df.groupby(['AGENCIA', pd.Grouper(key='DATA', freq='M')]):
+        dias_uteis = grupo[grupo['DIA_UTIL'] == 1]
+        for idx, (i, row) in enumerate(dias_uteis.iterrows()):
+            if idx < 31:
+                df.loc[i, f'DIA_MES_AJUSTADO_{idx+1}'] = 1
+    
+    # Criar tipo de dia consolidado para análise
+    df['TIPO_DIA_COMPLETO'] = 'normal'
+    df.loc[df['DIA_FERIADO'] == 1, 'TIPO_DIA_COMPLETO'] = 'feriado'
+    df.loc[df['DIA_SEMANA'] >= 6, 'TIPO_DIA_COMPLETO'] = 'fim_semana'
+    df.loc[df['EMENDA'] == 1, 'TIPO_DIA_COMPLETO'] = 'emenda'
+    df.loc[df['DIA_ADJACENTE_FERIADO'] == 1, 'TIPO_DIA_COMPLETO'] = 'adjacente_feriado'
+    df.loc[df['SEMANA_QUINTO_DU'] == 1, 'TIPO_DIA_COMPLETO'] = 'semana_quinto_du'
+    df.loc[df['FDS_DE_FERIADO'] == 1, 'TIPO_DIA_COMPLETO'] = 'fds_feriado'
+    
+    print("Features de calendário criadas com sucesso!")
+    return df
+
+# =============================================================================
+# 2. CLASSE CONFORMAL ADAPTADA COM MÚLTIPLAS JANELAS
+# =============================================================================
+
+class ConformalNumerariosMultiJanela:
+    """
+    Detector conformal com múltiplas janelas e parâmetros otimizados
+    """
+    
+    def __init__(self, 
+                 alphas=[0.01, 0.05, 0.1],
+                 epsilons=[0.7, 0.85, 0.92, 0.95],
+                 janelas={'curta': 7, 'media': 30, 'longa': 90, 'sazonal': 180}):
+        """
+        Inicializa com múltiplos parâmetros para teste
+        """
+        self.alphas = alphas
+        self.epsilons = epsilons
+        self.janelas = janelas
+        self.rtol = 1e-5
+        self.atol = 1e-5
+        
+        # Armazenar resultados de calibração
+        self.calibracao = {}
+        self.thresholds = {}
+        
+    def calibrar(self, df_calibracao, variaveis=['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']):
+        """
+        Calibra o detector para cada combinação de parâmetros
+        """
+        print("Iniciando calibração com múltiplos parâmetros...")
+        
+        # Para cada combinação de alpha e epsilon
+        for alpha, epsilon in product(self.alphas, self.epsilons):
+            key = f'alpha_{alpha}_epsilon_{epsilon}'
+            print(f"\nCalibrando {key}...")
+            
+            self.calibracao[key] = {}
+            self.thresholds[key] = {}
+            
+            # Para cada variável
+            for var in variaveis:
+                self.calibracao[key][var] = self._calibrar_variavel(
+                    df_calibracao, var, alpha, epsilon
+                )
+                
+            # Calibração multivariada
+            self.calibracao[key]['multivariada'] = self._calibrar_multivariada(
+                df_calibracao, variaveis, alpha, epsilon
+            )
+            
+            # Calcular thresholds adaptativos
+            self.thresholds[key] = self._calcular_thresholds_adaptativos(
+                df_calibracao, variaveis, alpha, epsilon
+            )
+        
+        print("\nCalibração concluída!")
+        
+    def _calibrar_variavel(self, df, variavel, alpha, epsilon):
+        """
+        Calibra estatísticas para uma variável específica
+        """
+        stats = {}
+        
+        # Para cada tipo de dia
+        for tipo in df['TIPO_DIA_COMPLETO'].unique():
+            df_tipo = df[df['TIPO_DIA_COMPLETO'] == tipo]
+            
+            if len(df_tipo) > 5:
+                valores = df_tipo[variavel].values
+                stats[tipo] = {
+                    'mediana': np.median(valores),
+                    'mad': np.median(np.abs(valores - np.median(valores))),
+                    'q1': np.percentile(valores, 25),
+                    'q3': np.percentile(valores, 75),
+                    'media': np.mean(valores),
+                    'std': np.std(valores),
+                    'n_obs': len(valores)
+                }
+        
+        # Estatísticas por dia da semana
+        for dia in range(1, 8):
+            df_dia = df[df['DIA_SEMANA'] == dia]
+            if len(df_dia) > 5:
+                valores = df_dia[variavel].values
+                stats[f'dia_semana_{dia}'] = {
+                    'mediana': np.median(valores),
+                    'mad': np.median(np.abs(valores - np.median(valores))),
+                    'media': np.mean(valores),
+                    'std': np.std(valores)
+                }
+        
+        # Estatísticas globais
+        stats['global'] = {
+            'mediana': df[variavel].median(),
+            'mad': np.median(np.abs(df[variavel] - df[variavel].median())),
+            'media': df[variavel].mean(),
+            'std': df[variavel].std()
+        }
+        
+        return stats
+    
+    def _calibrar_multivariada(self, df, variaveis, alpha, epsilon):
+        """
+        Calibra estatísticas multivariadas
+        """
+        # Normalizar dados
+        scaler = StandardScaler()
+        dados_norm = scaler.fit_transform(df[variaveis])
+        
+        # Calcular matriz de covariância
+        cov_matrix = np.cov(dados_norm.T)
+        
+        # Estatísticas por tipo de dia
+        stats = {
+            'scaler': scaler,
+            'cov_matrix': cov_matrix,
+            'cov_inv': np.linalg.pinv(cov_matrix)
+        }
+        
+        return stats
+    
+    def _calcular_thresholds_adaptativos(self, df, variaveis, alpha, epsilon):
+        """
+        Calcula thresholds baseados em simulação no período de calibração
+        """
+        # Dividir em janelas mensais para simulação
+        df['mes_ano'] = df['DATA'].dt.to_period('M')
+        meses = df['mes_ano'].unique()
+        
+        martingales_max = []
+        
+        if len(meses) > 3:
+            # Simular detecção mes a mes
+            for i in range(3, len(meses)):
+                df_historico = df[df['mes_ano'].isin(meses[:i])]
+                df_teste = df[df['mes_ano'] == meses[i]]
+                
+                if len(df_teste) > 10:
+                    # Calcular scores e p-valores
+                    scores = []
+                    for _, row in df_teste.iterrows():
+                        score = self._calcular_score_multi_janela(
+                            row, df_historico, variaveis
+                        )
+                        scores.append(score)
+                    
+                    # Converter em p-valores e martingale
+                    p_valores = self._scores_para_pvalores(scores)
+                    martingale = self._calcular_power_martingale(p_valores, epsilon)
+                    
+                    if len(martingale) > 0:
+                        martingales_max.append(np.max(martingale))
+        
+        # Definir thresholds
+        thresholds = {}
+        
+        if len(martingales_max) > 0:
+            # Percentil baseado em alpha
+            percentil = (1 - alpha) * 100
+            threshold_simulado = np.percentile(martingales_max, percentil)
+            
+            # Garantir threshold mínimo razoável
+            threshold_teorico = 1 / alpha
+            threshold_final = max(threshold_simulado, threshold_teorico * 0.5)
+            
+            thresholds['adaptativo'] = threshold_final
+            thresholds['teorico'] = threshold_teorico
+            thresholds['mediana_simulacao'] = np.median(martingales_max)
+            thresholds['max_simulacao'] = np.max(martingales_max)
+        else:
+            thresholds['adaptativo'] = 1 / alpha
+            thresholds['teorico'] = 1 / alpha
+        
+        return thresholds
+    
+    def _calcular_score_multi_janela(self, observacao, historico, variaveis):
+        """
+        Calcula score considerando múltiplas janelas temporais
+        """
+        scores_janelas = []
+        pesos_janelas = []
+        
+        for nome_janela, tamanho in self.janelas.items():
+            if len(historico) >= tamanho:
+                # Selecionar janela
+                janela = historico.iloc[-tamanho:]
+                
+                # Score para esta janela
+                score = self._calcular_score_contextual(
+                    observacao, janela, variaveis
+                )
+                
+                # Peso baseado no tipo de janela
+                peso = self._get_peso_janela(nome_janela, observacao)
+                
+                scores_janelas.append(score)
+                pesos_janelas.append(peso)
+        
+        # Combinar scores ponderados
+        if scores_janelas:
+            pesos_norm = np.array(pesos_janelas) / np.sum(pesos_janelas)
+            score_final = np.sum(np.array(scores_janelas) * pesos_norm)
+        else:
+            score_final = 0
+        
+        return score_final
+    
+    def _calcular_score_contextual(self, obs, historico, variaveis):
+        """
+        Calcula score considerando contexto de calendário
+        """
+        scores = []
+        
+        for var in variaveis:
+            valor_atual = obs[var]
+            
+            # Filtrar histórico por contexto similar
+            if obs['SEMANA_QUINTO_DU'] == 1:
+                # Comparar com outras semanas de quinto DU
+                hist_similar = historico[historico['SEMANA_QUINTO_DU'] == 1]
+            elif obs['DIA_FERIADO'] == 1:
+                # Comparar com outros feriados
+                hist_similar = historico[historico['DIA_FERIADO'] == 1]
+            elif obs['DIA_SEMANA'] >= 6:
+                # Fins de semana
+                hist_similar = historico[historico['DIA_SEMANA'] >= 6]
+            else:
+                # Dias normais do mesmo dia da semana
+                hist_similar = historico[
+                    (historico['DIA_SEMANA'] == obs['DIA_SEMANA']) &
+                    (historico['DIA_UTIL'] == 1)
+                ]
+            
+            # Se poucos dados similares, usar histórico completo
+            if len(hist_similar) < 10:
+                hist_similar = historico
+            
+            # Calcular score
+            valores_hist = hist_similar[var].values
+            if len(valores_hist) > 0:
+                mediana = np.median(valores_hist)
+                mad = np.median(np.abs(valores_hist - mediana))
+                
+                if mad > 0:
+                    score = np.abs(valor_atual - mediana) / mad
+                else:
+                    score = np.abs(valor_atual - mediana) / (np.std(valores_hist) + 1e-8)
+            else:
+                score = 0
+                
+            scores.append(score)
+        
+        # Retornar norma dos scores
+        return np.linalg.norm(scores)
+    
+    def _get_peso_janela(self, nome_janela, observacao):
+        """
+        Define peso da janela baseado no contexto
+        """
+        # Pesos base
+        pesos_base = {
+            'curta': 0.3,    # 7 dias - mudanças rápidas
+            'media': 0.4,    # 30 dias - padrão mensal
+            'longa': 0.2,    # 90 dias - tendência trimestral
+            'sazonal': 0.1   # 180 dias - sazonalidade
+        }
+        
+        # Ajustar pesos baseado no contexto
+        peso = pesos_base.get(nome_janela, 0.25)
+        
+        # Se é início de mês, dar mais peso para janela média
+        if observacao['DIA_MES'] <= 5 and nome_janela == 'media':
+            peso *= 1.5
+            
+        # Se é quinto DU, dar mais peso para janela curta
+        if observacao['SEMANA_QUINTO_DU'] == 1 and nome_janela == 'curta':
+            peso *= 1.3
+            
+        return peso
+    
+    def _scores_para_pvalores(self, scores):
+        """
+        Converte scores em p-valores conformais
+        """
+        n = len(scores)
+        p_valores = []
+        
+        for i in range(n):
+            if i == 0:
+                p_valores.append(1.0)
+            else:
+                # P-valor conformal
+                scores_ant = scores[:i]
+                score_atual = scores[i]
+                
+                # Proporção de scores anteriores >= atual
+                n_maiores = np.sum(scores_ant >= score_atual)
+                
+                # Tratar empates
+                n_empates = np.sum(np.abs(scores_ant - score_atual) < self.atol)
+                if n_empates > 0:
+                    u = np.random.uniform()
+                    p_valor = (n_maiores - n_empates + u * n_empates + 1) / (i + 1)
+                else:
+                    p_valor = (n_maiores + 1) / (i + 1)
+                
+                p_valores.append(max(p_valor, 1e-10))
+        
+        return np.array(p_valores)
+    
+    def _calcular_power_martingale(self, p_valores, epsilon):
+        """
+        Calcula Power Martingale
+        """
+        if len(p_valores) == 0:
+            return np.array([])
+            
+        martingale = np.zeros(len(p_valores))
+        martingale[0] = epsilon * p_valores[0] ** (epsilon - 1)
+        
+        for t in range(1, len(p_valores)):
+            incremento = epsilon * p_valores[t] ** (epsilon - 1)
+            martingale[t] = martingale[t-1] * incremento
+            
+            # Evitar overflow
+            if martingale[t] > 1e10:
+                martingale[t] = 1e10
+            elif martingale[t] < 1e-10:
+                martingale[t] = 1e-10
+                
+        return martingale
+    
+    def detectar_drift_completo(self, df_monitoramento, 
+                               variaveis=['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']):
+        """
+        Executa detecção de drift para todas as combinações de parâmetros
+        """
+        print("\nExecutando detecção de drift com múltiplos parâmetros...")
+        
+        resultados = {}
+        
+        # Para cada combinação de parâmetros
+        for alpha, epsilon in product(self.alphas, self.epsilons):
+            key = f'alpha_{alpha}_epsilon_{epsilon}'
+            print(f"\nProcessando {key}...")
+            
+            resultados[key] = {}
+            
+            # Análise por variável
+            for var in variaveis:
+                print(f"  - Variável: {var}")
+                resultado_var = self._detectar_drift_variavel(
+                    df_monitoramento, var, alpha, epsilon
+                )
+                resultados[key][var] = resultado_var
+            
+            # Análise multivariada
+            print("  - Análise multivariada")
+            resultado_multi = self._detectar_drift_multivariado(
+                df_monitoramento, variaveis, alpha, epsilon
+            )
+            resultados[key]['multivariada'] = resultado_multi
+        
+        return resultados
+    
+    def _detectar_drift_variavel(self, df, variavel, alpha, epsilon):
+        """
+        Detecta drift para uma variável específica
+        """
+        n = len(df)
+        scores = np.zeros(n)
+        p_valores = np.zeros(n)
+        contextos = []
+        
+        # Processar cada observação
+        for i in tqdm(range(n), desc=f"Processando {variavel}", leave=False):
+            obs = df.iloc[i]
+            
+            # Score multi-janela
+            if i < 30:  # Período inicial
+                score = 0
+                p_valor = 1.0
+            else:
+                # Calcular score para cada janela
+                scores_janelas = []
+                for nome, tamanho in self.janelas.items():
+                    inicio = max(0, i - tamanho)
+                    historico = df.iloc[inicio:i]
+                    
+                    score_janela = self._calcular_score_contextual(
+                        obs, historico, [variavel]
+                    )
+                    scores_janelas.append(score_janela)
+                
+                # Combinar scores
+                score = np.mean(scores_janelas)
+                
+                # P-valor
+                scores_ant = scores[max(0, i-90):i]  # Últimos 90 dias
+                if len(scores_ant) > 0:
+                    p_valor = self._score_para_pvalor(score, scores_ant)
+                else:
+                    p_valor = 1.0
+            
+            scores[i] = score
+            p_valores[i] = p_valor
+            
+            # Contexto
+            contextos.append({
+                'data': obs['DATA'],
+                'tipo_dia': obs['TIPO_DIA_COMPLETO'],
+                'dia_semana': obs['DIA_SEMANA'],
+                'quinto_du': obs['SEMANA_QUINTO_DU'],
+                'feriado': obs['DIA_FERIADO']
+            })
+        
+        # Calcular martingale
+        martingale = self._calcular_power_martingale(p_valores[30:], epsilon)
+        martingale_completo = np.ones(n)
+        martingale_completo[30:] = martingale
+        
+        # Detectar drift
+        key = f'alpha_{alpha}_epsilon_{epsilon}'
+        threshold = self.thresholds[key]['adaptativo']
+        deteccoes = martingale_completo > threshold
+        
+        # Filtrar detecções espúrias
+        deteccoes_filtradas = self._filtrar_deteccoes(deteccoes)
+        
+        return {
+            'scores': scores,
+            'p_valores': p_valores,
+            'martingale': martingale_completo,
+            'deteccoes': deteccoes,
+            'deteccoes_filtradas': deteccoes_filtradas,
+            'threshold': threshold,
+            'contextos': contextos
+        }
+    
+    def _detectar_drift_multivariado(self, df, variaveis, alpha, epsilon):
+        """
+        Detecta drift considerando todas as variáveis
+        """
+        n = len(df)
+        scores = np.zeros(n)
+        p_valores = np.zeros(n)
+        contribuicoes = {var: np.zeros(n) for var in variaveis}
+        
+        # Processar cada observação
+        for i in tqdm(range(n), desc="Processando multivariada", leave=False):
+            if i < 30:
+                scores[i] = 0
+                p_valores[i] = 1.0
+                for var in variaveis:
+                    contribuicoes[var][i] = 1.0 / len(variaveis)
+            else:
+                # Score multivariado
+                obs = df.iloc[i]
+                historico = df.iloc[max(0, i-90):i]
+                
+                # Calcular score e contribuições
+                score, contrib = self._calcular_score_multivariado_com_contrib(
+                    obs, historico, variaveis
+                )
+                
+                scores[i] = score
+                
+                # P-valor
+                scores_ant = scores[max(0, i-90):i]
+                if len(scores_ant) > 0:
+                    p_valores[i] = self._score_para_pvalor(score, scores_ant)
+                else:
+                    p_valores[i] = 1.0
+                
+                # Armazenar contribuições
+                for var, val in contrib.items():
+                    contribuicoes[var][i] = val
+        
+        # Calcular martingale
+        martingale = self._calcular_power_martingale(p_valores[30:], epsilon)
+        martingale_completo = np.ones(n)
+        martingale_completo[30:] = martingale
+        
+        # Detectar drift
+        key = f'alpha_{alpha}_epsilon_{epsilon}'
+        threshold = self.thresholds[key]['adaptativo']
+        deteccoes = martingale_completo > threshold
+        deteccoes_filtradas = self._filtrar_deteccoes(deteccoes)
+        
+        return {
+            'scores': scores,
+            'p_valores': p_valores,
+            'martingale': martingale_completo,
+            'deteccoes': deteccoes,
+            'deteccoes_filtradas': deteccoes_filtradas,
+            'threshold': threshold,
+            'contribuicoes': contribuicoes
+        }
+    
+    def _calcular_score_multivariado_com_contrib(self, obs, historico, variaveis):
+        """
+        Calcula score multivariado e contribuição de cada variável
+        """
+        scores_ind = {}
+        
+        for var in variaveis:
+            # Score individual
+            score_var = self._calcular_score_contextual(
+                obs, historico, [var]
+            )
+            scores_ind[var] = score_var
+        
+        # Score total (norma)
+        score_total = np.linalg.norm(list(scores_ind.values()))
+        
+        # Contribuições normalizadas
+        contrib = {}
+        soma_quadrados = sum(s**2 for s in scores_ind.values())
+        
+        if soma_quadrados > 0:
+            for var, score in scores_ind.items():
+                contrib[var] = score**2 / soma_quadrados
+        else:
+            for var in variaveis:
+                contrib[var] = 1.0 / len(variaveis)
+        
+        return score_total, contrib
+    
+    def _score_para_pvalor(self, score_atual, scores_historicos):
+        """
+        Converte score em p-valor
+        """
+        n = len(scores_historicos)
+        if n == 0:
+            return 1.0
+            
+        n_maiores = np.sum(scores_historicos >= score_atual)
+        n_empates = np.sum(np.abs(scores_historicos - score_atual) < self.atol)
+        
+        if n_empates > 0:
+            u = np.random.uniform()
+            p_valor = (n_maiores - n_empates + u * n_empates + 1) / (n + 1)
+        else:
+            p_valor = (n_maiores + 1) / (n + 1)
+            
+        return max(p_valor, 1e-10)
+    
+    def _filtrar_deteccoes(self, deteccoes, min_consecutivos=3):
+        """
+        Filtra detecções requerendo persistência
+        """
+        deteccoes_filtradas = np.zeros_like(deteccoes)
+        contador = 0
+        
+        for i in range(len(deteccoes)):
+            if deteccoes[i]:
+                contador += 1
+                if contador >= min_consecutivos:
+                    for j in range(i - min_consecutivos + 1, i + 1):
+                        deteccoes_filtradas[j] = True
+            else:
+                contador = 0
+                
+        return deteccoes_filtradas
+
+# =============================================================================
+# 3. VISUALIZAÇÕES COMPLETAS
+# =============================================================================
+
+def criar_dashboard_completo(resultados, df_monitoramento, 
+                            variaveis=['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']):
+    """
+    Cria dashboard com análise completa de todos os parâmetros
+    """
+    # Criar figura grande com subplots
+    n_alphas = len(resultados) // 4  # 4 epsilons por alpha
+    
+    fig = plt.figure(figsize=(24, 6 * n_alphas))
+    
+    # Data da pandemia
+    data_pandemia = pd.to_datetime('2020-03-01')
+    idx_pandemia = (df_monitoramento['DATA'] >= data_pandemia).argmax()
+    
+    # Organizar resultados por alpha
+    alphas_unicos = sorted(set(float(k.split('_')[1]) for k in resultados.keys()))
+    epsilons_unicos = sorted(set(float(k.split('_')[3]) for k in resultados.keys()))
+    
+    plot_idx = 1
+    
+    for alpha in alphas_unicos:
+        # Uma linha para cada alpha
+        for epsilon in epsilons_unicos:
+            key = f'alpha_{alpha}_epsilon_{epsilon}'
+            
+            # Subplot para este conjunto de parâmetros
+            ax = plt.subplot(len(alphas_unicos), len(epsilons_unicos), plot_idx)
+            
+            # Plot martingale multivariado
+            resultado = resultados[key]['multivariada']
+            
+            ax.semilogy(df_monitoramento['DATA'], resultado['martingale'], 
+                       'b-', linewidth=2, alpha=0.8)
+            ax.axhline(resultado['threshold'], color='red', linestyle='--', 
+                      linewidth=2, alpha=0.7, 
+                      label=f'Threshold={resultado["threshold"]:.1f}')
+            ax.axvline(data_pandemia, color='black', linestyle='--', 
+                      alpha=0.5, label='Pandemia')
+            
+            # Marcar detecções
+            deteccoes = resultado['deteccoes_filtradas']
+            if any(deteccoes):
+                idx_det = np.where(deteccoes)[0]
+                ax.scatter(df_monitoramento['DATA'].iloc[idx_det],
+                          resultado['martingale'][idx_det],
+                          color='red', s=50, marker='v')
+                
+                # Primeira detecção
+                primeira_det = np.argmax(deteccoes)
+                data_det = df_monitoramento['DATA'].iloc[primeira_det]
+                dias_apos = (data_det - data_pandemia).days
+                ax.text(0.02, 0.98, f'1ª det: {dias_apos}d', 
+                       transform=ax.transAxes, verticalalignment='top',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            ax.set_title(f'α={alpha}, ε={epsilon}')
+            ax.grid(True, alpha=0.3)
+            
+            if plot_idx <= len(epsilons_unicos):
+                ax.set_xlabel('Data')
+            if plot_idx % len(epsilons_unicos) == 1:
+                ax.set_ylabel('Martingale (log)')
+                
+            plot_idx += 1
+    
+    plt.suptitle('Análise de Sensibilidade - Diferentes Parâmetros', fontsize=16)
+    plt.tight_layout()
+    
+    return fig
+
+def plotar_analise_por_variavel(resultados, df_monitoramento, variavel, 
+                               alpha_escolhido=0.05, epsilon_escolhido=0.92):
+    """
+    Plota análise detalhada para uma variável específica
+    """
+    key = f'alpha_{alpha_escolhido}_epsilon_{epsilon_escolhido}'
+    resultado = resultados[key][variavel]
+    
+    fig, axes = plt.subplots(4, 1, figsize=(15, 12), sharex=True)
+    
+    data_pandemia = pd.to_datetime('2020-03-01')
+    
+    # 1. Série temporal original
+    ax1 = axes[0]
+    ax1.plot(df_monitoramento['DATA'], df_monitoramento[variavel], 
+             'b-', alpha=0.7, linewidth=1)
+    ax1.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5)
+    ax1.set_title(f'Série Temporal - {variavel}')
+    ax1.set_ylabel('Valor')
+    ax1.grid(True, alpha=0.3)
+    
+    # Colorir por tipo de dia
+    cores = {
+        'normal': 'blue',
+        'fim_semana': 'green',
+        'feriado': 'red',
+        'semana_quinto_du': 'purple',
+        'emenda': 'orange',
+        'adjacente_feriado': 'brown',
+        'fds_feriado': 'pink'
+    }
+    
+    for tipo, cor in cores.items():
+        mask = df_monitoramento['TIPO_DIA_COMPLETO'] == tipo
+        if any(mask):
+            ax1.scatter(df_monitoramento.loc[mask, 'DATA'],
+                       df_monitoramento.loc[mask, variavel],
+                       color=cor, alpha=0.3, s=10, label=tipo)
+    
+    # 2. Scores de não-conformidade
+    ax2 = axes[1]
+    ax2.plot(df_monitoramento['DATA'], resultado['scores'], 
+             'orange', alpha=0.7, linewidth=1)
+    ax2.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5)
+    ax2.set_title('Scores de Não-Conformidade')
+    ax2.set_ylabel('Score')
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. P-valores
+    ax3 = axes[2]
+    ax3.plot(df_monitoramento['DATA'], resultado['p_valores'], 
+             'green', alpha=0.7, linewidth=1)
+    ax3.axhline(0.05, color='red', linestyle=':', label='α=0.05')
+    ax3.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5)
+    ax3.set_title('P-valores')
+    ax3.set_ylabel('P-valor')
+    ax3.set_ylim(0, 1.1)
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # 4. Martingale
+    ax4 = axes[3]
+    ax4.semilogy(df_monitoramento['DATA'], resultado['martingale'], 
+                'purple', linewidth=2)
+    ax4.axhline(resultado['threshold'], color='red', linestyle='--', 
+               linewidth=2, label=f'Threshold={resultado["threshold"]:.1f}')
+    ax4.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5)
+    
+    # Marcar detecções
+    deteccoes = resultado['deteccoes_filtradas']
+    if any(deteccoes):
+        idx_det = np.where(deteccoes)[0]
+        ax4.scatter(df_monitoramento['DATA'].iloc[idx_det],
+                   resultado['martingale'][idx_det],
+                   color='red', s=100, marker='v', label='Drift Detectado')
+    
+    ax4.set_title(f'Power Martingale (α={alpha_escolhido}, ε={epsilon_escolhido})')
+    ax4.set_xlabel('Data')
+    ax4.set_ylabel('Martingale (log)')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    # Ajustar formato
+    for ax in axes:
+        ax.tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    return fig
+
+def criar_matriz_comparacao(resultados, df_monitoramento):
+    """
+    Cria matriz de comparação entre diferentes configurações
+    """
+    data_pandemia = pd.to_datetime('2020-03-01')
+    idx_pandemia = (df_monitoramento['DATA'] >= data_pandemia).argmax()
+    
+    # Extrair métricas para cada configuração
+    metricas = []
+    
+    for key, res_config in resultados.items():
+        alpha = float(key.split('_')[1])
+        epsilon = float(key.split('_')[3])
+        
+        # Para análise multivariada
+        res_multi = res_config['multivariada']
+        deteccoes = res_multi['deteccoes_filtradas']
+        
+        # Calcular métricas
+        if any(deteccoes):
+            primeira_det = np.argmax(deteccoes)
+            data_det = df_monitoramento['DATA'].iloc[primeira_det]
+            dias_apos = (data_det - data_pandemia).days
+        else:
+            dias_apos = np.inf
+            
+        falsos_pos = sum(deteccoes[:idx_pandemia])
+        taxa_deteccao = sum(deteccoes) / len(deteccoes) * 100
+        
+        # P-valores médios
+        p_val_pre = np.mean(res_multi['p_valores'][:idx_pandemia])
+        p_val_pos = np.mean(res_multi['p_valores'][idx_pandemia:])
+        
+        metricas.append({
+            'Alpha': alpha,
+            'Epsilon': epsilon,
+            'Dias até Detecção': dias_apos,
+            'Falsos Positivos': falsos_pos,
+            'Taxa Detecção (%)': taxa_deteccao,
+            'P-valor Pré': p_val_pre,
+            'P-valor Pós': p_val_pos,
+            'Threshold': res_multi['threshold']
+        })
+    
+    df_metricas = pd.DataFrame(metricas)
+    
+    # Criar heatmap
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    
+    # Heatmap de dias até detecção
+    pivot1 = df_metricas.pivot(index='Alpha', columns='Epsilon', values='Dias até Detecção')
+    sns.heatmap(pivot1, annot=True, fmt='.0f', cmap='RdYlGn_r', 
+                ax=ax1, cbar_kws={'label': 'Dias'})
+    ax1.set_title('Dias até Detecção (menor é melhor)')
+    
+    # Heatmap de falsos positivos
+    pivot2 = df_metricas.pivot(index='Alpha', columns='Epsilon', values='Falsos Positivos')
+    sns.heatmap(pivot2, annot=True, fmt='.0f', cmap='RdYlGn_r', 
+                ax=ax2, cbar_kws={'label': 'Falsos Positivos'})
+    ax2.set_title('Falsos Positivos (menor é melhor)')
+    
+    plt.tight_layout()
+    
+    # Imprimir tabela resumo
+    print("\n=== TABELA DE COMPARAÇÃO DE PARÂMETROS ===")
+    print(df_metricas.sort_values('Dias até Detecção').to_string(index=False))
+    
+    return fig, df_metricas
+
+def analisar_contribuicoes_variaveis(resultados, df_monitoramento, 
+                                   alpha=0.05, epsilon=0.92):
+    """
+    Analisa contribuição de cada variável para o drift detectado
+    """
+    key = f'alpha_{alpha}_epsilon_{epsilon}'
+    resultado = resultados[key]['multivariada']
+    contribuicoes = resultado['contribuicoes']
+    
+    fig, axes = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
+    
+    data_pandemia = pd.to_datetime('2020-03-01')
+    
+    # 1. Contribuições ao longo do tempo
+    ax1 = axes[0]
+    for var, contrib in contribuicoes.items():
+        ax1.plot(df_monitoramento['DATA'], contrib, label=var, alpha=0.7, linewidth=2)
+    
+    ax1.axvline(data_pandemia, color='red', linestyle='--', alpha=0.5, label='Pandemia')
+    ax1.set_title('Contribuição de Cada Variável para o Score Multivariado')
+    ax1.set_ylabel('Contribuição Relativa')
+    ax1.set_ylim(0, 1)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Contribuição média por período
+    ax2 = axes[1]
+    
+    idx_pandemia = (df_monitoramento['DATA'] >= data_pandemia).argmax()
+    
+    contrib_pre = {}
+    contrib_pos = {}
+    
+    for var, contrib in contribuicoes.items():
+        contrib_pre[var] = np.mean(contrib[:idx_pandemia])
+        contrib_pos[var] = np.mean(contrib[idx_pandemia:])
+    
+    x = np.arange(len(contribuicoes))
+    width = 0.35
+    
+    bars1 = ax2.bar(x - width/2, list(contrib_pre.values()), width, 
+                     label='Pré-pandemia', alpha=0.7)
+    bars2 = ax2.bar(x + width/2, list(contrib_pos.values()), width, 
+                     label='Pós-pandemia', alpha=0.7)
+    
+    ax2.set_xlabel('Variável')
+    ax2.set_ylabel('Contribuição Média')
+    ax2.set_title('Contribuição Média por Período')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(list(contribuicoes.keys()))
+    ax2.legend()
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    return fig
+
+# =============================================================================
+# 4. FUNÇÃO PRINCIPAL DE EXECUÇÃO
+# =============================================================================
+
+def executar_analise_completa_numerarios(filepath, agencia_id=None, modo_analise='performance'):
+    """
+    Executa análise completa com múltiplos parâmetros
+    
+    Args:
+        filepath: Caminho do arquivo CSV
+        agencia_id: ID da agência (None = primeira agência)
+        modo_analise: 'performance' (por DATA_PREVISAO) ou 'inferencia' (por DATA)
+    """
+    print("=== ANÁLISE COMPLETA DE DRIFT - NUMERÁRIOS ===\n")
+    print(f"Modo de análise: {modo_analise}")
+    
+    # 1. Carregar e preparar dados
+    print("\n1. Carregando e preparando dados...")
+    df = carregar_dados_numerarios_completo(filepath)
+    
+    # Escolher qual data usar baseado no modo
+    if modo_analise == 'performance':
+        # Analisar drift na performance do modelo ao longo do tempo
+        data_analise = 'DATA_PREVISAO'
+        df = df.sort_values(['AGENCIA', 'DATA_PREVISAO', 'DATA']).reset_index(drop=True)
+        print("   → Analisando drift por DATA_PREVISAO (quando modelo foi executado)")
+    else:
+        # Analisar drift nas previsões por período
+        data_analise = 'DATA'
+        df = df.sort_values(['AGENCIA', 'DATA']).reset_index(drop=True)
+        print("   → Analisando drift por DATA (período da inferência)")
+    
+    # Criar features baseadas na data escolhida
+    df = criar_features_calendario_numerarios(df, usar_data=data_analise)
+    
+    # Selecionar agência
+    if agencia_id is None:
+        agencia_id = df['AGENCIA'].iloc[0]
+    
+    df_agencia = df[df['AGENCIA'] == agencia_id].copy()
+    
+    print(f"\n   Agência: {agencia_id}")
+    print(f"   Período de execução: {df_agencia['DATA_PREVISAO'].min()} a {df_agencia['DATA_PREVISAO'].max()}")
+    print(f"   Período de inferência: {df_agencia['DATA'].min()} a {df_agencia['DATA'].max()}")
+    print(f"   Total de observações: {len(df_agencia)}")
+    
+    # Estatísticas de horizonte
+    print(f"\n   Horizonte de previsão:")
+    print(f"     Mínimo: {df_agencia['HORIZONTE_DIAS'].min()} dias")
+    print(f"     Máximo: {df_agencia['HORIZONTE_DIAS'].max()} dias")
+    print(f"     Médio: {df_agencia['HORIZONTE_DIAS'].mean():.1f} dias")
+    
+    # 2. Separar períodos baseado na data escolhida
+    print(f"\n2. Separando períodos de calibração e monitoramento (baseado em {data_analise})...")
+    
+    data_inicio = df_agencia[data_analise].min()
+    data_fim_calibracao = data_inicio + pd.DateOffset(months=6)
+    
+    df_calibracao = df_agencia[df_agencia[data_analise] < data_fim_calibracao]
+    df_monitoramento = df_agencia[df_agencia[data_analise] >= data_fim_calibracao]
+    
+    print(f"   Calibração: {len(df_calibracao)} observações")
+    print(f"   Monitoramento: {len(df_monitoramento)} observações")
+    
+    # 3. Criar e calibrar detector
+    print("\n3. Criando detector com múltiplos parâmetros...")
+    
+    detector = ConformalNumerariosMultiJanela(
+        alphas=[0.01, 0.05, 0.1],
+        epsilons=[0.7, 0.85, 0.92, 0.95],
+        janelas={'curta': 7, 'media': 30, 'longa': 90, 'sazonal': 180}
+    )
+    
+    detector.calibrar(df_calibracao)
+    
+    # 4. Executar detecção
+    print("\n4. Executando detecção de drift...")
+    resultados = detector.detectar_drift_completo(df_monitoramento)
+    
+    # 5. Visualizações
+    print("\n5. Gerando visualizações...")
+    
+    # Dashboard principal
+    fig1 = criar_dashboard_completo(resultados, df_monitoramento)
+    plt.savefig('drift_numerarios_sensibilidade.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Matriz de comparação
+    fig2, df_metricas = criar_matriz_comparacao(resultados, df_monitoramento)
+    plt.savefig('drift_numerarios_comparacao.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Análise por variável (com melhor configuração)
+    variaveis = ['SAQUE', 'SAQUE_CEI', 'DEPOSITO', 'DEP_CEI']
+    
+    # Encontrar melhor configuração
+    melhor_config = df_metricas.loc[df_metricas['Dias até Detecção'].idxmin()]
+    alpha_best = melhor_config['Alpha']
+    epsilon_best = melhor_config['Epsilon']
+    
+    print(f"\n6. Analisando com melhor configuração: α={alpha_best}, ε={epsilon_best}")
+    
+    for var in variaveis:
+        fig = plotar_analise_por_variavel(resultados, df_monitoramento, 
+                                         var, alpha_best, epsilon_best)
+        plt.savefig(f'drift_numerarios_{var.lower()}.png', dpi=300, bbox_inches='tight')
+        plt.show()
+    
+    # Análise de contribuições
+    fig3 = analisar_contribuicoes_variaveis(resultados, df_monitoramento, 
+                                           alpha_best, epsilon_best)
+    plt.savefig('drift_numerarios_contribuicoes.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 7. Relatório final
+    print("\n" + "="*60)
+    print("RELATÓRIO FINAL - ANÁLISE DE DRIFT NUMERÁRIOS")
+    print("="*60)
+    
+    print(f"\nMelhor configuração encontrada:")
+    print(f"  Alpha: {alpha_best}")
+    print(f"  Epsilon: {epsilon_best}")
+    print(f"  Dias até detecção: {melhor_config['Dias até Detecção']}")
+    print(f"  Falsos positivos: {melhor_config['Falsos Positivos']}")
+    print(f"  Threshold usado: {melhor_config['Threshold']:.2f}")
+    
+    # Salvar resultados
+    print("\n8. Salvando resultados...")
+    
+    # Salvar métricas
+    df_metricas.to_csv('metricas_drift_numerarios.csv', index=False)
+    
+    # Salvar resultados detalhados da melhor configuração
+    key_best = f'alpha_{alpha_best}_epsilon_{epsilon_best}'
+    
+    for var in variaveis + ['multivariada']:
+        resultado = resultados[key_best][var]
+        
+        df_resultado = pd.DataFrame({
+            'data': df_monitoramento['DATA'],
+            'score': resultado['scores'],
+            'p_valor': resultado['p_valores'],
+            'martingale': resultado['martingale'],
+            'drift_detectado': resultado['deteccoes_filtradas']
+        })
+        
+        df_resultado.to_csv(f'resultado_drift_{var.lower()}.csv', index=False)
+    
+    print("\nAnálise concluída com sucesso!")
+    
+    return resultados, df_metricas
+
+# =============================================================================
+# EXEMPLO DE USO
+# =============================================================================
+
+if __name__ == "__main__":
+    # Para executar:
+    # resultados, df_metricas = executar_analise_completa_numerarios('previsoes_numerario_pre_pos_pandemia.csv')
+    
+    print("\nFramework completo de detecção de drift para Numerários implementado!")
+    print("Use: executar_analise_completa_numerarios('arquivo.csv', agencia_id)")
