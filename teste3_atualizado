@@ -808,7 +808,164 @@ def plot_dashboard_modular(resultados: Dict, df_merged: pd.DataFrame,
         logger.info(f"Dashboard salvo em {save_path}")
     
     plt.show()
+### multivariada 
 
+def executar_analise_multivariada(resultados_univariado, df_merged, config, calc_pvalores):
+    """
+    Implementa análise multivariada completa para detecção de drift conjunto.
+    
+    A análise multivariada detecta mudanças que afetam múltiplas variáveis
+    simultaneamente, capturando drifts sistêmicos que análises individuais
+    podem perder.
+    """
+    logger.info("\n📊 ANÁLISE MULTIVARIADA")
+    logger.info("="*50)
+    
+    variaveis = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+    
+    # Preparar DataFrame com melhores scores de cada variável
+    df_scores_multi = pd.DataFrame()
+    
+    for var in variaveis:
+        if var in resultados_univariado:
+            melhor_score_nome = resultados_univariado[var]['melhor_score']
+            scores = resultados_univariado[var]['scores'][melhor_score_nome]
+            df_scores_multi[var] = scores
+            logger.info(f"  Usando score '{melhor_score_nome}' para {var}")
+    
+    # Calcular p-valores multivariados usando distância euclidiana
+    p_det_multi, p_rnd_multi = calcular_pvalores_multivariado_otimizado(
+        df_scores_multi, 
+        calc_pvalores
+    )
+    
+    # Otimizar epsilon se configurado
+    if config.epsilon_range:
+        epsilon_otimo = otimizar_epsilon(p_rnd_multi, config.epsilon_range)
+        logger.info(f"  Epsilon otimizado para multivariado: {epsilon_otimo:.3f}")
+    else:
+        epsilon_otimo = config.epsilon_power
+    
+    # Calcular martingales
+    mart_power_multi = power_martingale(p_rnd_multi, epsilon=epsilon_otimo)
+    mart_jumper_multi = simple_jumper_martingale(p_rnd_multi)
+    
+    # Detectar mudanças
+    deteccoes_multi = detectar_mudanca_otimizada(mart_power_multi, config)
+    
+    logger.info(f"\n✓ Detecções multivariadas: {len(deteccoes_multi)}")
+    if deteccoes_multi:
+        logger.info(f"  Primeira detecção: índice {deteccoes_multi[0]}")
+        
+        # Análise de contribuição - qual variável mais contribuiu para o drift
+        contribuicoes = analisar_contribuicoes_drift(
+            df_scores_multi, 
+            deteccoes_multi[:5]  # Analisar primeiras 5 detecções
+        )
+        
+        logger.info("\n📌 Análise de Contribuições:")
+        for var, contrib in contribuicoes.items():
+            logger.info(f"  {var}: {contrib:.1%} de contribuição média")
+    
+    return {
+        'p_valores': {'det': p_det_multi, 'rnd': p_rnd_multi},
+        'martingale_power': mart_power_multi,
+        'martingale_jumper': mart_jumper_multi,
+        'deteccoes': deteccoes_multi,
+        'df_scores': df_scores_multi,
+        'epsilon_usado': epsilon_otimo
+    }
+
+def calcular_pvalores_multivariado_otimizado(df_scores, calc_pvalores):
+    """
+    Calcula p-valores para análise multivariada com otimização de memória.
+    
+    Usa norma L2 (distância euclidiana) entre vetores de scores como
+    medida de não-conformidade multivariada.
+    """
+    df_scores = df_scores.reset_index(drop=True)
+    N = len(df_scores)
+    p_det = np.zeros(N)
+    p_rnd = np.zeros(N)
+    
+    # Usar janela deslizante para otimização
+    janela = deque(maxlen=calc_pvalores.window_size)
+    
+    for n in tqdm(range(N), desc="Calculando p-valores multivariados"):
+        if n == 0:
+            p_det[0] = 1
+            p_rnd[0] = 1
+            janela.append(df_scores.iloc[0].values)
+            continue
+        
+        # Vetor de scores atual
+        score_n = df_scores.iloc[n].values
+        
+        # Calcular distâncias aos pontos na janela
+        distancias = []
+        for score_hist in janela:
+            dist = np.linalg.norm(score_n - score_hist)
+            distancias.append(dist)
+        
+        # Adicionar distância a si mesmo (sempre 0)
+        distancias.append(0)
+        distancias = np.array(distancias)
+        
+        # P-valor baseado na distância
+        dist_atual = 0  # Distância do ponto a si mesmo
+        
+        # P-valor determinístico
+        p_det[n] = np.mean(distancias <= dist_atual + 1e-10)
+        
+        # P-valor randomizado
+        countG = np.sum(distancias > dist_atual)
+        countE = np.sum(np.isclose(distancias, dist_atual, rtol=1e-3, atol=1e-3))
+        u = np.random.uniform() if countE > 0 else 0
+        p_rnd[n] = (countG + u * countE) / len(distancias)
+        
+        # Adicionar à janela
+        janela.append(score_n)
+    
+    return p_det, p_rnd
+
+def analisar_contribuicoes_drift(df_scores, indices_deteccao):
+    """
+    Analisa qual variável mais contribuiu para as detecções de drift.
+    
+    Usa análise de variância explicada para determinar contribuições relativas.
+    """
+    if not indices_deteccao:
+        return {}
+    
+    contribuicoes = {var: [] for var in df_scores.columns}
+    
+    for idx in indices_deteccao:
+        if idx < len(df_scores):
+            # Scores no ponto de detecção
+            scores_ponto = df_scores.iloc[idx]
+            
+            # Calcular contribuição relativa (proporção da variância)
+            total_var = np.sum(scores_ponto ** 2)
+            
+            if total_var > 0:
+                for var in df_scores.columns:
+                    contrib = (scores_ponto[var] ** 2) / total_var
+                    contribuicoes[var].append(contrib)
+    
+    # Médias das contribuições
+    contribuicoes_medias = {}
+    for var, valores in contribuicoes.items():
+        if valores:
+            contribuicoes_medias[var] = np.mean(valores)
+        else:
+            contribuicoes_medias[var] = 0
+    
+    # Ordenar por contribuição
+    contribuicoes_medias = dict(sorted(contribuicoes_medias.items(), 
+                                     key=lambda x: x[1], 
+                                     reverse=True))
+    
+    return contribuicoes_medias
 # ============================================================================
 # PARTE 8: PIPELINE PRINCIPAL OTIMIZADO
 # ============================================================================
@@ -914,11 +1071,53 @@ def executar_analise_drift_otimizada(df_merged: pd.DataFrame,
     # =========================
     # ANÁLISE MULTIVARIADA
     # =========================
-    # [Código similar ao original mas com otimizações]
+    
+       resultados_multivariado = executar_analise_multivariada(
+        resultados_univariado,
+        df_merged,
+        config,
+        calc_pvalores
+    )
     
     return {
         'univariado': resultados_univariado,
         'config': config.__dict__
+    }
+ # =========================
+    # ANÁLISE COMPARATIVA
+    # =========================
+    logger.info("\n📊 ANÁLISE COMPARATIVA")
+    logger.info("="*50)
+    
+    # Comparar sensibilidade: quem detectou primeiro?
+    primeira_uni = float('inf')
+    var_primeira = None
+    
+    for var, res in resultados_univariado.items():
+        if res['deteccoes'] and res['deteccoes'][0] < primeira_uni:
+            primeira_uni = res['deteccoes'][0]
+            var_primeira = var
+    
+    primeira_multi = resultados_multivariado['deteccoes'][0] if resultados_multivariado['deteccoes'] else float('inf')
+    
+    if primeira_uni < primeira_multi:
+        logger.info(f"  ⚡ Detecção mais rápida: Univariada ({var_primeira}) no índice {primeira_uni}")
+    elif primeira_multi < primeira_uni:
+        logger.info(f"  ⚡ Detecção mais rápida: Multivariada no índice {primeira_multi}")
+    else:
+        logger.info("  ⚠️  Nenhuma detecção encontrada")
+    
+    # Salvar logs
+    calc_pvalores.salvar_log(f"pvalores_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    
+    return {
+        'univariado': resultados_univariado,
+        'multivariado': resultados_multivariado,
+        'config': config.__dict__,
+        'analise_comparativa': {
+            'primeira_deteccao_uni': (var_primeira, primeira_uni) if var_primeira else None,
+            'primeira_deteccao_multi': primeira_multi if primeira_multi < float('inf') else None
+        }
     }
 
 def detectar_mudanca_otimizada(martingale: np.ndarray, config: ConfiguracaoDrift) -> List[int]:
@@ -949,7 +1148,42 @@ def detectar_mudanca_otimizada(martingale: np.ndarray, config: ConfiguracaoDrift
             alarmes_consecutivos = 0
     
     return deteccoes
-
+ # =========================
+    # ANÁLISE COMPARATIVA
+    # =========================
+    logger.info("\n📊 ANÁLISE COMPARATIVA")
+    logger.info("="*50)
+    
+    # Comparar sensibilidade: quem detectou primeiro?
+    primeira_uni = float('inf')
+    var_primeira = None
+    
+    for var, res in resultados_univariado.items():
+        if res['deteccoes'] and res['deteccoes'][0] < primeira_uni:
+            primeira_uni = res['deteccoes'][0]
+            var_primeira = var
+    
+    primeira_multi = resultados_multivariado['deteccoes'][0] if resultados_multivariado['deteccoes'] else float('inf')
+    
+    if primeira_uni < primeira_multi:
+        logger.info(f"  ⚡ Detecção mais rápida: Univariada ({var_primeira}) no índice {primeira_uni}")
+    elif primeira_multi < primeira_uni:
+        logger.info(f"  ⚡ Detecção mais rápida: Multivariada no índice {primeira_multi}")
+    else:
+        logger.info("  ⚠️  Nenhuma detecção encontrada")
+    
+    # Salvar logs
+    calc_pvalores.salvar_log(f"pvalores_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    
+    return {
+        'univariado': resultados_univariado,
+        'multivariado': resultados_multivariado,
+        'config': config.__dict__,
+        'analise_comparativa': {
+            'primeira_deteccao_uni': (var_primeira, primeira_uni) if var_primeira else None,
+            'primeira_deteccao_multi': primeira_multi if primeira_multi < float('inf') else None
+        }
+    }
 # ============================================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================================
@@ -1013,3 +1247,59 @@ def main():
 # Executar se chamado diretamente
 if __name__ == "__main__":
     resultados, df_merged = main()
+
+_____________________________
+# Script de execução com análise completa
+if __name__ == "__main__":
+    # Configurar para sua necessidade específica
+    config = ConfiguracaoDrift(
+        agencia_analise=20,  # Ou None para todas
+        janela_deslizante=1000,  # Reduz complexidade computacional
+        janelas_analise=[7, 30, 90],
+        epsilon_power=0.92,
+        epsilon_range=(0.85, 0.95),  # Otimização automática
+        scores_ativos=['mad', 'contextual', 'std'],  # Escolha modular
+        usar_otimizacao_memoria=True,
+        threshold_mult=20.0,  # 1/α = 20 (α = 0.05)
+        min_consecutivos=3,
+        periodo_calibracao=90
+    )
+    
+    try:
+        # Executar análise
+        logger.info("🏁 INICIANDO ANÁLISE DE DRIFT")
+        logger.info(f"Configuração: {json.dumps(config.__dict__, indent=2)}")
+        
+        # Carregar dados
+        features_df, previsoes_df = carregar_dados(config=config)
+        
+        # Combinar dados
+        df_merged = merge_real_previsto(features_df, previsoes_df, config)
+        
+        # Executar análise completa
+        resultados = executar_analise_drift_otimizada(df_merged, config)
+        
+        # Salvar resultados
+        with open('resultados_drift_analise.json', 'w') as f:
+            # Converter arrays numpy para listas para serialização
+            resultados_serializaveis = {
+                'config': resultados['config'],
+                'analise_comparativa': resultados['analise_comparativa'],
+                'resumo_deteccoes': {
+                    'univariado': {
+                        var: len(res['deteccoes']) 
+                        for var, res in resultados['univariado'].items()
+                    },
+                    'multivariado': len(resultados['multivariado']['deteccoes'])
+                }
+            }
+            json.dump(resultados_serializaveis, f, indent=2)
+        
+        # Gerar todas as visualizações
+        gerar_visualizacoes_completas(resultados, df_merged, config)
+        
+        logger.info("\n✅ ANÁLISE CONCLUÍDA COM SUCESSO!")
+        
+    except Exception as e:
+        logger.error(f"❌ Erro na execução: {str(e)}")
+        raise
