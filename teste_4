@@ -1,0 +1,1409 @@
+# Sistema Completo de Detecção de Drift para Modelo Numerários
+# AutoMLOps Framework - Versão 2.0 Completa
+# ============================================================================
+# Este arquivo contém TODAS as implementações necessárias, incluindo a análise
+# multivariada completa que estava faltando no código original.
+# ============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+from datetime import datetime, timedelta
+from collections import deque
+from typing import Dict, List, Tuple, Optional, Union
+import warnings
+import logging
+from dataclasses import dataclass
+from scipy.linalg import pinv
+from scipy.spatial.distance import mahalanobis
+import json
+import os
+
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURAÇÃO E LOGGING
+# ============================================================================
+
+# Configurar logging para manter histórico completo
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('drift_detection.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Configurações de visualização
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+plt.rcParams['figure.figsize'] = (12, 6)
+plt.rcParams['font.size'] = 10
+
+# ============================================================================
+# DATACLASSES PARA CONFIGURAÇÃO
+# ============================================================================
+
+@dataclass
+class ConfiguracaoDrift:
+    """Configurações parametrizáveis do sistema de detecção"""
+    # Filtros
+    agencia_analise: Optional[int] = None  # None = todas as agências
+    
+    # Janelas temporais
+    janela_deslizante: int = 1000  # Tamanho da janela para otimização
+    janelas_analise: List[int] = None  # [7, 30, 90] por padrão
+    
+    # Parâmetros do método conformal
+    epsilon_power: float = 0.92  # Power martingale
+    epsilon_range: Tuple[float, float] = (0.85, 0.95)  # Range para otimização
+    
+    # Detecção
+    threshold_mult: float = 20.0
+    min_consecutivos: int = 3
+    periodo_calibracao: int = 90
+    
+    # Scores
+    scores_ativos: List[str] = None  # None = todos os scores
+    
+    # Performance
+    usar_otimizacao_memoria: bool = True
+    max_historico_log: int = 10000  # Máximo de entradas no log
+    
+    def __post_init__(self):
+        if self.janelas_analise is None:
+            self.janelas_analise = [7, 30, 90]
+        if self.scores_ativos is None:
+            self.scores_ativos = ['mad', 'contextual', 'std']  # Padrão: 3 melhores
+
+# ============================================================================
+# PARTE 1: CARREGAMENTO E PREPARAÇÃO DOS DADOS
+# ============================================================================
+
+def carregar_dados(path_features='features.parquet', 
+                   path_previsoes='previsoes_numerario_pre_pos_pandemia.csv',
+                   config: ConfiguracaoDrift = None):
+    """
+    Carrega os dados com configuração parametrizável.
+    
+    Args:
+        path_features: Caminho para arquivo de features
+        path_previsoes: Caminho para arquivo de previsões
+        config: Configurações do sistema
+    """
+    logger.info("Iniciando carregamento de dados...")
+    
+    # Carregar features
+    features_df = pd.read_parquet(path_features)
+    logger.info(f"Features carregadas: {features_df.shape}")
+    
+    # Carregar previsões
+    previsoes_df = pd.read_csv(path_previsoes)
+    
+    # Padronizar nomes
+    previsoes_df = previsoes_df.rename(columns={
+        'DEP_CEI': 'DEPCEI',
+        'DEPOSITO': 'DEP', 
+        'SAQUE': 'SAQ',
+        'SAQUE_CEI': 'SAQCEI'
+    })
+    
+    # Converter datas
+    features_df['DATA'] = pd.to_datetime(features_df['DATA'])
+    previsoes_df['DATA'] = pd.to_datetime(previsoes_df['DATA'])
+    previsoes_df['DATA_PREVISAO'] = pd.to_datetime(previsoes_df['DATA_PREVISAO'])
+    previsoes_df['DATA_REFERENCIA'] = pd.to_datetime(previsoes_df['DATA_REFERENCIA'])
+    
+    logger.info(f"Previsões carregadas: {previsoes_df.shape}")
+    
+    return features_df, previsoes_df
+
+def merge_real_previsto(features_df, previsoes_df, config: ConfiguracaoDrift):
+    """
+    Combina dados reais com previstos usando configuração.
+    """
+    logger.info("Combinando dados reais e previstos...")
+    
+    # Preparar dados
+    variaveis_alvo = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+    
+    # Dados reais
+    real_cols = ['AGENCIA', 'DATA'] + variaveis_alvo
+    df_real = features_df[real_cols].copy()
+    
+    for var in variaveis_alvo:
+        df_real[f'{var}_REAL'] = df_real[var]
+    df_real = df_real.drop(columns=variaveis_alvo)
+    
+    # Dados previstos
+    prev_cols = ['AGENCIA', 'DATA', 'DATA_PREVISAO', 'DATA_REFERENCIA'] + variaveis_alvo
+    df_prev = previsoes_df[prev_cols].copy()
+    
+    for var in variaveis_alvo:
+        df_prev[f'{var}_PREV'] = df_prev[var]
+    df_prev = df_prev.drop(columns=variaveis_alvo)
+    
+    # Merge
+    df_merged = pd.merge(df_real, df_prev, on=['AGENCIA', 'DATA'], how='inner')
+    
+    # Features de calendário
+    features_calendario = [col for col in features_df.columns 
+                          if col not in ['AGENCIA', 'DATA'] + variaveis_alvo]
+    
+    df_merged = pd.merge(df_merged, 
+                        features_df[['AGENCIA', 'DATA'] + features_calendario],
+                        on=['AGENCIA', 'DATA'], 
+                        how='left')
+    
+    # Aplicar filtro de agência se configurado
+    if config.agencia_analise is not None:
+        logger.info(f"Filtrando para agência {config.agencia_analise}")
+        df_merged = df_merged[df_merged['AGENCIA'] == config.agencia_analise].copy()
+    
+    logger.info(f"Dados combinados: {df_merged.shape}")
+    logger.info(f"Período: {df_merged['DATA'].min()} a {df_merged['DATA'].max()}")
+    
+    return df_merged
+
+# ============================================================================
+# PARTE 2: SCORES DE NÃO-CONFORMIDADE MODULARES
+# ============================================================================
+
+class ScoreNaoConformidade:
+    """Classe base para scores de não-conformidade"""
+    
+    def __init__(self, nome: str, janela_historico: int = 30, epsilon: float = 1e-8):
+        self.nome = nome
+        self.janela_historico = janela_historico
+        self.epsilon = epsilon
+        self.historico = deque(maxlen=janela_historico)
+        
+    def calcular(self, real: np.ndarray, previsto: np.ndarray, 
+                 contexto: Optional[pd.DataFrame] = None) -> np.ndarray:
+        """Método a ser implementado pelas subclasses"""
+        raise NotImplementedError
+        
+    def adicionar_historico(self, valores):
+        """Adiciona valores ao histórico mantendo janela"""
+        self.historico.extend(valores)
+
+# Implementações específicas de cada score
+
+class ScoreAbsoluto(ScoreNaoConformidade):
+    """Score de erro absoluto simples"""
+    
+    def calcular(self, real: np.ndarray, previsto: np.ndarray, 
+                 contexto: Optional[pd.DataFrame] = None) -> np.ndarray:
+        return np.abs(real - previsto)
+
+class ScoreRelativo(ScoreNaoConformidade):
+    """Score de erro relativo"""
+    
+    def calcular(self, real: np.ndarray, previsto: np.ndarray,
+                 contexto: Optional[pd.DataFrame] = None) -> np.ndarray:
+        return np.abs(real - previsto) / (np.abs(real) + self.epsilon)
+
+class ScorePadronizado(ScoreNaoConformidade):
+    """Score padronizado (Z-score) com janela otimizada"""
+    
+    def calcular(self, real: np.ndarray, previsto: np.ndarray,
+                 contexto: Optional[pd.DataFrame] = None) -> np.ndarray:
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        
+        for i in range(len(erros)):
+            if len(self.historico) >= 5:  # Mínimo para calcular std
+                hist_array = np.array(self.historico)
+                std_hist = np.std(hist_array)
+                if std_hist > 0:
+                    scores[i] = np.abs(erros[i]) / std_hist
+                else:
+                    scores[i] = np.abs(erros[i])
+            else:
+                scores[i] = np.abs(erros[i])
+            
+            # Atualizar histórico
+            self.historico.append(erros[i])
+        
+        return scores
+
+class ScoreMAD(ScoreNaoConformidade):
+    """Score normalizado por MAD com janela otimizada"""
+    
+    def calcular(self, real: np.ndarray, previsto: np.ndarray,
+                 contexto: Optional[pd.DataFrame] = None) -> np.ndarray:
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        
+        for i in range(len(erros)):
+            if len(self.historico) >= 5:
+                hist_array = np.array(self.historico)
+                mad = np.median(np.abs(hist_array - np.median(hist_array)))
+                scores[i] = np.abs(erros[i]) / (1.4826 * mad + self.epsilon)
+            else:
+                scores[i] = np.abs(erros[i])
+            
+            self.historico.append(erros[i])
+        
+        return scores
+
+class ScoreContextual(ScoreNaoConformidade):
+    """Score contextual considerando tipo de dia"""
+    
+    def __init__(self, nome: str = "contextual", janela_historico: int = 30, 
+                 epsilon: float = 1e-8):
+        super().__init__(nome, janela_historico, epsilon)
+        self.historico_por_contexto = {}
+    
+    def calcular(self, real: np.ndarray, previsto: np.ndarray,
+                 contexto: Optional[pd.DataFrame] = None) -> np.ndarray:
+        if contexto is None or 'DIA_SEMANA' not in contexto.columns:
+            # Fallback para score absoluto
+            return np.abs(real - previsto)
+        
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        tipo_dia = contexto['DIA_SEMANA'].values
+        
+        for i in range(len(erros)):
+            contexto_atual = str(tipo_dia[i])
+            
+            # Inicializar histórico do contexto se necessário
+            if contexto_atual not in self.historico_por_contexto:
+                self.historico_por_contexto[contexto_atual] = deque(maxlen=self.janela_historico)
+            
+            hist_contexto = self.historico_por_contexto[contexto_atual]
+            
+            if len(hist_contexto) >= 3:
+                hist_array = np.array(hist_contexto)
+                mad = np.median(np.abs(hist_array - np.median(hist_array)))
+                scores[i] = np.abs(erros[i]) / (1.4826 * mad + self.epsilon)
+            else:
+                scores[i] = np.abs(erros[i])
+            
+            # Atualizar histórico do contexto
+            hist_contexto.append(erros[i])
+        
+        return scores
+
+class ScoreMahalanobis(ScoreNaoConformidade):
+    """Score de Mahalanobis com verificação de estabilidade"""
+    
+    def __init__(self, nome: str = "mahalanobis", janela_historico: int = 30,
+                 epsilon: float = 1e-8, condition_threshold: float = 1e10):
+        super().__init__(nome, janela_historico, epsilon)
+        self.condition_threshold = condition_threshold
+        self.features_historico = deque(maxlen=janela_historico)
+    
+    def calcular(self, real: np.ndarray, previsto: np.ndarray,
+                 contexto: Optional[pd.DataFrame] = None) -> np.ndarray:
+        if contexto is None:
+            return np.abs(real - previsto)
+        
+        # Features importantes
+        features_importantes = ['DIA_SEMANA', 'SEMANA_QUINTO_DU', 'DIA_FERIADO', 
+                               'DIA_UTIL', 'EMENDA', 'DIA_ADJACENTE_FERIADO']
+        features_disponiveis = [f for f in features_importantes if f in contexto.columns]
+        
+        if len(features_disponiveis) < 2:
+            return np.abs(real - previsto)
+        
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        X_contexto = contexto[features_disponiveis].values
+        
+        for i in range(len(erros)):
+            if len(self.features_historico) > len(features_disponiveis) + 1:
+                X_hist = np.array(list(self.features_historico))
+                
+                # Calcular covariância com regularização
+                cov_matrix = np.cov(X_hist.T)
+                
+                # Verificar condition number
+                eigenvalues = np.linalg.eigvalsh(cov_matrix)
+                condition_number = np.max(eigenvalues) / (np.min(eigenvalues) + self.epsilon)
+                
+                if condition_number < self.condition_threshold:
+                    # Matriz bem condicionada
+                    try:
+                        inv_cov = np.linalg.inv(cov_matrix + self.epsilon * np.eye(len(features_disponiveis)))
+                        centro = np.mean(X_hist, axis=0)
+                        dist = mahalanobis(X_contexto[i], centro, inv_cov)
+                        scores[i] = np.abs(erros[i]) * (1 + dist)
+                    except:
+                        scores[i] = np.abs(erros[i])
+                else:
+                    # Matriz mal condicionada - usar regularização
+                    logger.warning(f"Condition number alto: {condition_number:.2e}")
+                    scores[i] = np.abs(erros[i])
+            else:
+                scores[i] = np.abs(erros[i])
+            
+            # Atualizar histórico
+            self.features_historico.append(X_contexto[i])
+            
+        return scores
+
+# ============================================================================
+# PARTE 3: GERENCIADOR DE SCORES MODULAR
+# ============================================================================
+
+class GerenciadorScores:
+    """Gerencia diferentes implementações de scores"""
+    
+    def __init__(self, config: ConfiguracaoDrift):
+        self.config = config
+        self.scores_disponiveis = {
+            'abs': ScoreAbsoluto,
+            'rel': ScoreRelativo,
+            'std': ScorePadronizado,
+            'mad': ScoreMAD,
+            'contextual': ScoreContextual,
+            'mahalanobis': ScoreMahalanobis
+        }
+        self.scores_ativos = {}
+        self._inicializar_scores()
+    
+    def _inicializar_scores(self):
+        """Inicializa apenas os scores configurados"""
+        janela = self.config.janela_deslizante if self.config.usar_otimizacao_memoria else 30
+        
+        for nome_score in self.config.scores_ativos:
+            if nome_score in self.scores_disponiveis:
+                classe_score = self.scores_disponiveis[nome_score]
+                self.scores_ativos[nome_score] = classe_score(
+                    nome=nome_score,
+                    janela_historico=janela
+                )
+                logger.info(f"Score '{nome_score}' inicializado")
+    
+    def calcular_score(self, nome_score: str, real: np.ndarray, 
+                      previsto: np.ndarray, contexto: Optional[pd.DataFrame] = None) -> np.ndarray:
+        """Calcula um score específico"""
+        if nome_score not in self.scores_ativos:
+            raise ValueError(f"Score '{nome_score}' não está ativo. Scores ativos: {list(self.scores_ativos.keys())}")
+        
+        return self.scores_ativos[nome_score].calcular(real, previsto, contexto)
+    
+    def calcular_todos_scores(self, real: np.ndarray, previsto: np.ndarray,
+                            contexto: Optional[pd.DataFrame] = None) -> Dict[str, np.ndarray]:
+        """Calcula todos os scores ativos"""
+        resultados = {}
+        for nome_score, score_obj in self.scores_ativos.items():
+            resultados[nome_score] = score_obj.calcular(real, previsto, contexto)
+        return resultados
+
+# ============================================================================
+# PARTE 4: CÁLCULO DE P-VALORES COM OTIMIZAÇÃO
+# ============================================================================
+
+class CalculadorPValoresOtimizado:
+    """Calcula p-valores com janela deslizante para otimização de memória"""
+    
+    def __init__(self, window_size: int = 1000, manter_log_completo: bool = True):
+        self.window_size = window_size
+        self.manter_log_completo = manter_log_completo
+        self.log_completo = [] if manter_log_completo else None
+        
+    def calcular_pvalores_univariado(self, scores: np.ndarray, 
+                                   rtol: float = 1e-3, atol: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Calcula p-valores com janela deslizante otimizada.
+        
+        Window size = 1000 significa que mantemos apenas as últimas 1000 observações
+        para comparação, reduzindo complexidade de O(n²) para O(n*window_size).
+        """
+        N = len(scores)
+        p_det = np.zeros(N)
+        p_rnd = np.zeros(N)
+        
+        # Janela deslizante de scores
+        janela_scores = deque(maxlen=self.window_size)
+        
+        for n in tqdm(range(N), desc="Calculando p-valores otimizado"):
+            score_n = scores[n]
+            
+            # Adicionar score atual à janela
+            janela_scores.append(score_n)
+            
+            # Para as primeiras observações, usar todas disponíveis
+            scores_comparacao = list(janela_scores)
+            n_comparacao = len(scores_comparacao)
+            
+            if n == 0:
+                p_det[0] = 1
+                p_rnd[0] = 1
+                if self.manter_log_completo:
+                    self.log_completo.append({
+                        'n': n,
+                        'score': score_n,
+                        'p_det': 1,
+                        'p_rnd': 1,
+                        'n_comparacao': 1
+                    })
+                continue
+            
+            # P-valor determinístico
+            scores_array = np.array(scores_comparacao)
+            p_det[n] = np.mean(scores_array >= score_n)
+            
+            # P-valor randomizado
+            countG = np.sum(scores_array > score_n)
+            countE = np.sum(np.isclose(scores_array, score_n, rtol=rtol, atol=atol))
+            u = np.random.uniform() if countE > 0 else 0
+            # Usar n+1 para evitar divisão por zero e manter propriedade válida
+            p_rnd[n] = (countG + u * countE) / (n_comparacao)
+            
+            # Log para análise posterior
+            if self.manter_log_completo:
+                self.log_completo.append({
+                    'n': n,
+                    'score': score_n,
+                    'p_det': p_det[n],
+                    'p_rnd': p_rnd[n],
+                    'n_comparacao': n_comparacao,
+                    'countG': countG,
+                    'countE': countE
+                })
+        
+        logger.info(f"P-valores calculados com janela de tamanho {self.window_size}")
+        return p_det, p_rnd
+    
+    def salvar_log(self, filepath: str = "pvalores_log.json"):
+        """Salva log completo para análise posterior"""
+        if self.manter_log_completo and self.log_completo:
+            # Limitar tamanho do log se necessário
+            log_salvar = self.log_completo[-10000:]  # Últimas 10k entradas
+            with open(filepath, 'w') as f:
+                json.dump(log_salvar, f, indent=2)
+            logger.info(f"Log salvo em {filepath}")
+
+# ============================================================================
+# PARTE 5: CÁLCULO DE P-VALORES MULTIVARIADOS
+# ============================================================================
+
+def calcular_pvalores_multivariado_otimizado(df_scores: pd.DataFrame, 
+                                            calc_pvalores: CalculadorPValoresOtimizado,
+                                            rtol: float = 1e-3, 
+                                            atol: float = 1e-3) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calcula p-valores para análise multivariada com otimização de memória.
+    
+    Usa norma L2 (distância euclidiana) entre vetores de scores como
+    medida de não-conformidade multivariada.
+    """
+    df_scores = df_scores.reset_index(drop=True)
+    N = len(df_scores)
+    p_det = np.zeros(N)
+    p_rnd = np.zeros(N)
+    
+    # Usar janela deslizante para otimização
+    janela = deque(maxlen=calc_pvalores.window_size)
+    
+    for n in tqdm(range(N), desc="Calculando p-valores multivariados"):
+        if n == 0:
+            p_det[0] = 1
+            p_rnd[0] = 1
+            janela.append(df_scores.iloc[0].values)
+            continue
+        
+        # Vetor de scores atual
+        score_n = df_scores.iloc[n].values
+        
+        # Calcular distâncias aos pontos na janela
+        distancias = []
+        for score_hist in janela:
+            dist = np.linalg.norm(score_n - score_hist)
+            distancias.append(dist)
+        
+        # Adicionar distância a si mesmo (sempre 0)
+        distancias.append(0)
+        distancias = np.array(distancias)
+        
+        # P-valor baseado na distância
+        dist_atual = 0  # Distância do ponto a si mesmo
+        
+        # P-valor determinístico
+        p_det[n] = np.mean(distancias <= dist_atual + 1e-10)
+        
+        # P-valor randomizado
+        countG = np.sum(distancias > dist_atual)
+        countE = np.sum(np.isclose(distancias, dist_atual, rtol=rtol, atol=atol))
+        u = np.random.uniform() if countE > 0 else 0
+        p_rnd[n] = (countG + u * countE) / len(distancias)
+        
+        # Adicionar à janela
+        janela.append(score_n)
+    
+    return p_det, p_rnd
+
+# ============================================================================
+# PARTE 6: OTIMIZAÇÃO DE EPSILON
+# ============================================================================
+
+def otimizar_epsilon(p_valores: np.ndarray, epsilon_range: Tuple[float, float] = (0.85, 0.95),
+                    n_splits: int = 5) -> float:
+    """
+    Otimiza o parâmetro epsilon usando validação cruzada temporal.
+    
+    A ideia é encontrar o epsilon que maximiza a capacidade de detecção
+    mantendo estabilidade em períodos sem drift.
+    """
+    logger.info(f"Otimizando epsilon no range {epsilon_range}")
+    
+    epsilons = np.linspace(epsilon_range[0], epsilon_range[1], 11)
+    scores = []
+    
+    for eps in epsilons:
+        # Dividir série em splits temporais
+        split_size = len(p_valores) // n_splits
+        estabilidade_scores = []
+        
+        for i in range(n_splits - 1):
+            inicio = i * split_size
+            fim = (i + 1) * split_size
+            
+            # Calcular martingale no período
+            p_split = p_valores[inicio:fim]
+            mart = power_martingale(p_split, epsilon=eps)
+            
+            # Medir estabilidade (menor variação é melhor)
+            if len(mart) > 1:
+                cv = np.std(np.log(mart + 1e-10)) / np.mean(np.log(mart + 1e-10))
+                estabilidade_scores.append(cv)
+        
+        score_medio = np.mean(estabilidade_scores)
+        scores.append(score_medio)
+        logger.debug(f"Epsilon {eps:.3f}: score {score_medio:.4f}")
+    
+    # Escolher epsilon com melhor score (menor variação)
+    idx_otimo = np.argmin(scores)
+    epsilon_otimo = epsilons[idx_otimo]
+    
+    logger.info(f"Epsilon ótimo encontrado: {epsilon_otimo:.3f}")
+    return epsilon_otimo
+
+# ============================================================================
+# PARTE 7: MARTINGALES
+# ============================================================================
+
+def power_martingale(p_values: np.ndarray, epsilon: float = 0.92) -> np.ndarray:
+    """Power Martingale com proteção contra underflow"""
+    # Evitar p-valores zero
+    p_values = np.maximum(p_values, 1e-10)
+    
+    # Power martingale com log-sum-exp trick para estabilidade numérica
+    log_betting = np.log(epsilon) + (epsilon - 1) * np.log(p_values)
+    log_M = np.cumsum(log_betting)
+    M = np.exp(log_M)
+    
+    return M
+
+def simple_jumper_martingale(p_values: np.ndarray, J: float = 0.01) -> np.ndarray:
+    """Simple Jumper Martingale"""
+    n = len(p_values)
+    capital = np.zeros(n + 1)
+    capital[0] = 1.0
+    
+    C = {epsilon: 1/3 for epsilon in [-1, 0, 1]}
+    
+    for i in range(n):
+        # Transição
+        C_new = {}
+        total = sum(C.values())
+        for epsilon in [-1, 0, 1]:
+            C_new[epsilon] = (1 - J) * C[epsilon] + J * total / 3
+        
+        # Update
+        p = p_values[i]
+        for epsilon in [-1, 0, 1]:
+            f_eps = 1 + epsilon * (p - 0.5)
+            C_new[epsilon] *= f_eps
+        
+        capital[i + 1] = sum(C_new.values())
+        C = C_new
+    
+    return capital[1:]
+
+# ============================================================================
+# PARTE 8: DETECÇÃO DE MUDANÇA
+# ============================================================================
+
+def detectar_mudanca_otimizada(martingale: np.ndarray, config: ConfiguracaoDrift) -> List[int]:
+    """
+    Detecta mudanças com configurações parametrizáveis.
+    """
+    deteccoes = []
+    alarmes_consecutivos = 0
+    
+    # Calibrar threshold
+    periodo_calib = min(config.periodo_calibracao, len(martingale) // 4)
+    if periodo_calib > 30:
+        baseline = martingale[:periodo_calib]
+        threshold_base = np.percentile(baseline, 95) * config.threshold_mult
+    else:
+        threshold_base = config.threshold_mult
+    
+    # Detectar
+    for i in range(len(martingale)):
+        if martingale[i] > threshold_base:
+            alarmes_consecutivos += 1
+            
+            if alarmes_consecutivos >= config.min_consecutivos:
+                if not deteccoes or i - deteccoes[-1] > 30:
+                    deteccoes.append(i)
+                    logger.debug(f"Drift detectado no índice {i}")
+        else:
+            alarmes_consecutivos = 0
+    
+    return deteccoes
+
+# ============================================================================
+# PARTE 9: ANÁLISE DE CONTRIBUIÇÕES
+# ============================================================================
+
+def analisar_contribuicoes_drift(df_scores: pd.DataFrame, indices_deteccao: List[int]) -> Dict[str, float]:
+    """
+    Analisa qual variável mais contribuiu para as detecções de drift.
+    
+    Usa análise de variância explicada para determinar contribuições relativas.
+    """
+    if not indices_deteccao:
+        return {}
+    
+    contribuicoes = {var: [] for var in df_scores.columns}
+    
+    for idx in indices_deteccao:
+        if idx < len(df_scores):
+            # Scores no ponto de detecção
+            scores_ponto = df_scores.iloc[idx]
+            
+            # Calcular contribuição relativa (proporção da variância)
+            total_var = np.sum(scores_ponto ** 2)
+            
+            if total_var > 0:
+                for var in df_scores.columns:
+                    contrib = (scores_ponto[var] ** 2) / total_var
+                    contribuicoes[var].append(contrib)
+    
+    # Médias das contribuições
+    contribuicoes_medias = {}
+    for var, valores in contribuicoes.items():
+        if valores:
+            contribuicoes_medias[var] = np.mean(valores)
+        else:
+            contribuicoes_medias[var] = 0
+    
+    # Ordenar por contribuição
+    contribuicoes_medias = dict(sorted(contribuicoes_medias.items(), 
+                                     key=lambda x: x[1], 
+                                     reverse=True))
+    
+    return contribuicoes_medias
+
+# ============================================================================
+# PARTE 10: ANÁLISE MULTIVARIADA COMPLETA
+# ============================================================================
+
+def executar_analise_multivariada(resultados_univariado: Dict, 
+                                 df_merged: pd.DataFrame,
+                                 config: ConfiguracaoDrift, 
+                                 calc_pvalores: CalculadorPValoresOtimizado) -> Dict:
+    """
+    Implementa análise multivariada completa para detecção de drift conjunto.
+    
+    A análise multivariada detecta mudanças que afetam múltiplas variáveis
+    simultaneamente, capturando drifts sistêmicos que análises individuais
+    podem perder.
+    """
+    logger.info("\n📊 ANÁLISE MULTIVARIADA")
+    logger.info("="*50)
+    
+    variaveis = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+    
+    # Preparar DataFrame com melhores scores de cada variável
+    df_scores_multi = pd.DataFrame()
+    
+    for var in variaveis:
+        if var in resultados_univariado:
+            melhor_score_nome = resultados_univariado[var]['melhor_score']
+            scores = resultados_univariado[var]['scores'][melhor_score_nome]
+            df_scores_multi[var] = scores
+            logger.info(f"  Usando score '{melhor_score_nome}' para {var}")
+    
+    # Calcular p-valores multivariados usando distância euclidiana
+    p_det_multi, p_rnd_multi = calcular_pvalores_multivariado_otimizado(
+        df_scores_multi, 
+        calc_pvalores
+    )
+    
+    # Otimizar epsilon se configurado
+    if config.epsilon_range:
+        epsilon_otimo = otimizar_epsilon(p_rnd_multi, config.epsilon_range)
+        logger.info(f"  Epsilon otimizado para multivariado: {epsilon_otimo:.3f}")
+    else:
+        epsilon_otimo = config.epsilon_power
+    
+    # Calcular martingales
+    mart_power_multi = power_martingale(p_rnd_multi, epsilon=epsilon_otimo)
+    mart_jumper_multi = simple_jumper_martingale(p_rnd_multi)
+    
+    # Detectar mudanças
+    deteccoes_multi = detectar_mudanca_otimizada(mart_power_multi, config)
+    
+    logger.info(f"\n✓ Detecções multivariadas: {len(deteccoes_multi)}")
+    if deteccoes_multi:
+        logger.info(f"  Primeira detecção: índice {deteccoes_multi[0]}")
+        
+        # Análise de contribuição - qual variável mais contribuiu para o drift
+        contribuicoes = analisar_contribuicoes_drift(
+            df_scores_multi, 
+            deteccoes_multi[:5]  # Analisar primeiras 5 detecções
+        )
+        
+        logger.info("\n📌 Análise de Contribuições:")
+        for var, contrib in contribuicoes.items():
+            logger.info(f"  {var}: {contrib:.1%} de contribuição média")
+    
+    return {
+        'p_valores': {'det': p_det_multi, 'rnd': p_rnd_multi},
+        'martingale_power': mart_power_multi,
+        'martingale_jumper': mart_jumper_multi,
+        'deteccoes': deteccoes_multi,
+        'df_scores': df_scores_multi,
+        'epsilon_usado': epsilon_otimo,
+        'contribuicoes': contribuicoes if deteccoes_multi else {}
+    }
+
+# ============================================================================
+# PARTE 11: VISUALIZAÇÕES MELHORADAS
+# ============================================================================
+
+def plot_boxplot_erros_contexto_melhorado(df_merged: pd.DataFrame, variavel: str = 'SAQ',
+                                         save_path: str = None):
+    """
+    Versão melhorada do boxplot com melhor visibilidade.
+    """
+    # Criar figura com subplots maiores
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    axes = axes.flatten()
+    
+    # Calcular erro
+    erro = df_merged[f'{variavel}_REAL'] - df_merged[f'{variavel}_PREV']
+    erro_rel = erro / (df_merged[f'{variavel}_REAL'] + 1e-8)
+    
+    contextos = [
+        ('DIA_SEMANA', 'Dia da Semana', None),
+        ('DIA_FERIADO', 'Feriado', {0: 'Não', 1: 'Sim'}),
+        ('SEMANA_QUINTO_DU', '5º Dia Útil', {0: 'Não', 1: 'Sim'}),
+        ('DIA_ADJACENTE_FERIADO', 'Adjacente Feriado', {0: 'Não', 1: 'Sim'}),
+        ('EMENDA', 'Emenda', {0: 'Não', 1: 'Sim'}),
+        ('FDS_DE_FERIADO', 'FDS de Feriado', {0: 'Não', 1: 'Sim'})
+    ]
+    
+    for idx, (feature, titulo, labels_map) in enumerate(contextos):
+        if idx >= len(axes):
+            break
+            
+        ax = axes[idx]
+        
+        if feature in df_merged.columns:
+            # Preparar dados
+            data_plot = pd.DataFrame({
+                'Erro_Relativo': erro_rel,
+                feature: df_merged[feature]
+            })
+            
+            if labels_map:
+                data_plot[feature] = data_plot[feature].map(labels_map).fillna('Outro')
+            
+            # Criar boxplot com estilo melhorado
+            unique_vals = data_plot[feature].unique()
+            positions = range(len(unique_vals))
+            
+            box_data = [data_plot[data_plot[feature] == val]['Erro_Relativo'].values 
+                       for val in unique_vals]
+            
+            # Boxplot customizado
+            bp = ax.boxplot(box_data, positions=positions, widths=0.6,
+                           patch_artist=True, showfliers=False)
+            
+            # Customizar cores
+            colors = plt.cm.Set3(np.linspace(0, 1, len(unique_vals)))
+            for patch, color in zip(bp['boxes'], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.7)
+            
+            # Melhorar linhas
+            for element in ['whiskers', 'fliers', 'means', 'medians', 'caps']:
+                if element in bp:
+                    plt.setp(bp[element], color='black', linewidth=1.5)
+            
+            # Labels e título
+            ax.set_xticklabels(unique_vals, rotation=45 if len(str(unique_vals[0])) > 3 else 0)
+            ax.set_title(f'Erro Relativo por {titulo}', fontsize=14, fontweight='bold')
+            ax.set_xlabel(titulo, fontsize=12)
+            ax.set_ylabel('Erro Relativo', fontsize=12)
+            ax.set_ylim(-1, 1)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            # Adicionar linha de referência
+            ax.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+    
+    # Remover eixos vazios
+    for idx in range(len(contextos), len(axes)):
+        fig.delaxes(axes[idx])
+    
+    plt.suptitle(f'Análise de Erros por Contexto - {variavel}', fontsize=18, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        logger.info(f"Boxplot salvo em {save_path}")
+    
+    plt.show()
+
+def plot_dashboard_modular(resultados: Dict, df_merged: pd.DataFrame,
+                          componentes: List[str] = None, save_path: str = None):
+    """
+    Dashboard modular que permite escolher quais componentes visualizar.
+    
+    Args:
+        componentes: Lista de componentes a incluir:
+            - 'martingales': Comparação de martingales
+            - 'metricas': Métricas por variável
+            - 'timeline': Timeline de detecções
+            - 'scores': Comparação de scores
+    """
+    if componentes is None:
+        componentes = ['martingales', 'metricas', 'timeline']
+    
+    n_componentes = len(componentes)
+    fig, axes = plt.subplots(n_componentes, 1, figsize=(15, 5*n_componentes))
+    
+    if n_componentes == 1:
+        axes = [axes]
+    
+    for idx, componente in enumerate(componentes):
+        ax = axes[idx]
+        
+        if componente == 'martingales':
+            # Comparação de martingales
+            for var in ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']:
+                if var in resultados['univariado']:
+                    mart = resultados['univariado'][var]['martingale_power']
+                    ax.plot(mart, label=f'{var}', linewidth=2)
+            
+            if 'multivariado' in resultados:
+                mart_multi = resultados['multivariado']['martingale_power']
+                ax.plot(mart_multi, label='Multivariado', linewidth=3, 
+                       linestyle='--', color='red')
+            
+            ax.set_yscale('log')
+            ax.set_xlabel('Tempo')
+            ax.set_ylabel('Martingale (log)')
+            ax.set_title('Evolução dos Martingales')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+        elif componente == 'metricas':
+            # Métricas por variável
+            variaveis = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+            max_martingales = []
+            deteccoes_count = []
+            
+            for var in variaveis:
+                if var in resultados['univariado']:
+                    max_mart = np.max(resultados['univariado'][var]['martingale_power'])
+                    max_martingales.append(np.log10(max_mart))
+                    n_det = len(resultados['univariado'][var]['deteccoes'])
+                    deteccoes_count.append(n_det)
+                else:
+                    max_martingales.append(0)
+                    deteccoes_count.append(0)
+            
+            x = np.arange(len(variaveis))
+            width = 0.35
+            
+            ax2 = ax.twinx()
+            
+            bars1 = ax.bar(x - width/2, max_martingales, width, 
+                          label='Log10(Max Martingale)', color='skyblue')
+            bars2 = ax2.bar(x + width/2, deteccoes_count, width,
+                           label='Nº Detecções', color='orange')
+            
+            ax.set_xlabel('Variável')
+            ax.set_ylabel('Log10(Max Martingale)', color='skyblue')
+            ax2.set_ylabel('Número de Detecções', color='orange')
+            ax.set_title('Métricas de Drift por Variável')
+            ax.set_xticks(x)
+            ax.set_xticklabels(variaveis)
+            ax.tick_params(axis='y', labelcolor='skyblue')
+            ax2.tick_params(axis='y', labelcolor='orange')
+            
+            # Adicionar valores nas barras
+            for bar, val in zip(bars1, max_martingales):
+                height = bar.get_height()
+                ax.annotate(f'{val:.1f}',
+                           xy=(bar.get_x() + bar.get_width() / 2, height),
+                           xytext=(0, 3),
+                           textcoords="offset points",
+                           ha='center', va='bottom')
+            
+            for bar, val in zip(bars2, deteccoes_count):
+                height = bar.get_height()
+                ax2.annotate(f'{int(val)}',
+                            xy=(bar.get_x() + bar.get_width() / 2, height),
+                            xytext=(0, 3),
+                            textcoords="offset points",
+                            ha='center', va='bottom')
+            
+        elif componente == 'timeline':
+            # Timeline de detecções
+            tempo = np.arange(len(df_merged))
+            
+            # Base timeline
+            ax.scatter(tempo, np.zeros_like(tempo), alpha=0.1, s=1, c='gray')
+            
+            # Detecções por variável
+            cores = ['blue', 'green', 'orange', 'purple']
+            variaveis = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+            
+            for idx_var, (var, cor) in enumerate(zip(variaveis, cores)):
+                if var in resultados['univariado']:
+                    deteccoes = resultados['univariado'][var]['deteccoes']
+                    if deteccoes:
+                        ax.scatter(deteccoes, [idx_var+1]*len(deteccoes),
+                                 label=f'{var}', s=100, alpha=0.7, c=cor)
+            
+            # Detecções multivariadas
+            if 'multivariado' in resultados:
+                det_multi = resultados['multivariado']['deteccoes']
+                if det_multi:
+                    ax.scatter(det_multi, [5]*len(det_multi),
+                             label='Multivariado', s=150, marker='^', c='red')
+            
+            ax.set_ylim(-0.5, 5.5)
+            ax.set_xlabel('Tempo')
+            ax.set_yticks(range(6))
+            ax.set_yticklabels([''] + variaveis + ['Multi'])
+            ax.set_title('Timeline de Detecções de Drift')
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            ax.grid(True, axis='x', alpha=0.3)
+            
+        elif componente == 'scores':
+            # Comparação de scores (se disponível)
+            if 'univariado' in resultados and 'SAQ' in resultados['univariado']:
+                scores_data = resultados['univariado']['SAQ'].get('scores', {})
+                if scores_data:
+                    scores_nomes = list(scores_data.keys())
+                    scores_max = [np.percentile(scores_data[s], 95) for s in scores_nomes]
+                    
+                    bars = ax.bar(range(len(scores_nomes)), scores_max)
+                    ax.set_xticks(range(len(scores_nomes)))
+                    ax.set_xticklabels(scores_nomes, rotation=45)
+                    ax.set_ylabel('Score (percentil 95)')
+                    ax.set_title('Comparação de Scores - SAQ')
+                    
+                    # Colorir melhor score
+                    melhor_idx = np.argmax(scores_max)
+                    bars[melhor_idx].set_color('red')
+    
+    plt.suptitle('Dashboard de Monitoramento de Drift', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        logger.info(f"Dashboard salvo em {save_path}")
+    
+    plt.show()
+
+# ============================================================================
+# PARTE 12: PIPELINE PRINCIPAL COMPLETO
+# ============================================================================
+
+def executar_analise_drift_otimizada(df_merged: pd.DataFrame, 
+                                   config: ConfiguracaoDrift) -> Dict:
+    """
+    Pipeline principal otimizado com análise univariada E multivariada completas.
+    """
+    logger.info("🚀 Iniciando análise de drift otimizada...")
+    
+    variaveis = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+    resultados_univariado = {}
+    
+    # Inicializar gerenciador de scores
+    gerenciador_scores = GerenciadorScores(config)
+    
+    # Inicializar calculador de p-valores otimizado
+    calc_pvalores = CalculadorPValoresOtimizado(
+        window_size=config.janela_deslizante,
+        manter_log_completo=True
+    )
+    
+    # =========================
+    # ANÁLISE UNIVARIADA
+    # =========================
+    logger.info("📊 ANÁLISE UNIVARIADA")
+    logger.info("="*50)
+    
+    for var in variaveis:
+        logger.info(f"\n▶️  Analisando {var}...")
+        
+        # Valores reais e previstos
+        real = df_merged[f'{var}_REAL'].values
+        previsto = df_merged[f'{var}_PREV'].values
+        
+        # Features de contexto
+        features_contexto = [col for col in df_merged.columns 
+                           if col.startswith(('DIA_', 'SEMANA_', 'QTD_', 
+                                            'NUM_', 'EMENDA', 'FDS_'))]
+        contexto_df = df_merged[features_contexto]
+        
+        # Calcular scores configurados
+        scores_dict = gerenciador_scores.calcular_todos_scores(real, previsto, contexto_df)
+        
+        # Para cada score, calcular p-valores e detectar
+        resultados_var = {
+            'scores': scores_dict,
+            'p_valores': {},
+            'martingales': {},
+            'deteccoes_por_score': {}
+        }
+        
+        melhor_score = None
+        melhor_deteccao = float('inf')
+        
+        for nome_score, valores_score in scores_dict.items():
+            # Calcular p-valores com otimização
+            p_det, p_rnd = calc_pvalores.calcular_pvalores_univariado(valores_score)
+            
+            # Otimizar epsilon se configurado
+            if config.epsilon_range:
+                epsilon_otimo = otimizar_epsilon(p_rnd, config.epsilon_range)
+            else:
+                epsilon_otimo = config.epsilon_power
+            
+            # Power martingale
+            mart_power = power_martingale(p_rnd, epsilon=epsilon_otimo)
+            
+            # Detectar mudanças
+            deteccoes = detectar_mudanca_otimizada(
+                mart_power, 
+                config=config
+            )
+            
+            resultados_var['p_valores'][nome_score] = {'det': p_det, 'rnd': p_rnd}
+            resultados_var['martingales'][nome_score] = mart_power
+            resultados_var['deteccoes_por_score'][nome_score] = deteccoes
+            
+            # Verificar se é o melhor score
+            if deteccoes and deteccoes[0] < melhor_deteccao:
+                melhor_score = nome_score
+                melhor_deteccao = deteccoes[0]
+            
+            logger.info(f"  - Score {nome_score}: {len(deteccoes)} detecções")
+            if deteccoes:
+                logger.info(f"    Primeira detecção: índice {deteccoes[0]}")
+        
+        # Selecionar melhor score
+        if melhor_score:
+            resultados_var['melhor_score'] = melhor_score
+            resultados_var['martingale_power'] = resultados_var['martingales'][melhor_score]
+            resultados_var['deteccoes'] = resultados_var['deteccoes_por_score'][melhor_score]
+            logger.info(f"  ✓ Melhor score selecionado: {melhor_score}")
+        else:
+            # Fallback para primeiro score disponível
+            primeiro_score = list(scores_dict.keys())[0]
+            resultados_var['melhor_score'] = primeiro_score
+            resultados_var['martingale_power'] = resultados_var['martingales'][primeiro_score]
+            resultados_var['deteccoes'] = resultados_var['deteccoes_por_score'][primeiro_score]
+            logger.info(f"  ⚠️  Nenhuma detecção clara, usando score {primeiro_score}")
+        
+        resultados_univariado[var] = resultados_var
+    
+    # =========================
+    # ANÁLISE MULTIVARIADA
+    # =========================
+    resultados_multivariado = executar_analise_multivariada(
+        resultados_univariado,
+        df_merged,
+        config,
+        calc_pvalores
+    )
+    
+    # =========================
+    # ANÁLISE COMPARATIVA
+    # =========================
+    logger.info("\n📊 ANÁLISE COMPARATIVA")
+    logger.info("="*50)
+    
+    # Comparar sensibilidade: quem detectou primeiro?
+    primeira_uni = float('inf')
+    var_primeira = None
+    
+    for var, res in resultados_univariado.items():
+        if res['deteccoes'] and res['deteccoes'][0] < primeira_uni:
+            primeira_uni = res['deteccoes'][0]
+            var_primeira = var
+    
+    primeira_multi = resultados_multivariado['deteccoes'][0] if resultados_multivariado['deteccoes'] else float('inf')
+    
+    if primeira_uni < primeira_multi:
+        logger.info(f"  ⚡ Detecção mais rápida: Univariada ({var_primeira}) no índice {primeira_uni}")
+    elif primeira_multi < primeira_uni:
+        logger.info(f"  ⚡ Detecção mais rápida: Multivariada no índice {primeira_multi}")
+    else:
+        logger.info("  ⚠️  Nenhuma detecção encontrada")
+    
+    # Análise de cobertura
+    total_deteccoes_uni = sum(len(res['deteccoes']) for res in resultados_univariado.values())
+    total_deteccoes_multi = len(resultados_multivariado['deteccoes'])
+    
+    logger.info(f"\n📊 Resumo de Detecções:")
+    logger.info(f"  - Total detecções univariadas: {total_deteccoes_uni}")
+    logger.info(f"  - Total detecções multivariadas: {total_deteccoes_multi}")
+    
+    # Salvar logs
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    calc_pvalores.salvar_log(f"pvalores_log_{timestamp}.json")
+    
+    return {
+        'univariado': resultados_univariado,
+        'multivariado': resultados_multivariado,
+        'config': config.__dict__,
+        'analise_comparativa': {
+            'primeira_deteccao_uni': (var_primeira, primeira_uni) if var_primeira else None,
+            'primeira_deteccao_multi': primeira_multi if primeira_multi < float('inf') else None,
+            'total_deteccoes_uni': total_deteccoes_uni,
+            'total_deteccoes_multi': total_deteccoes_multi
+        }
+    }
+
+# ============================================================================
+# PARTE 13: ANÁLISE DO PERÍODO PANDEMIA
+# ============================================================================
+
+def analisar_periodo_pandemia(df_merged: pd.DataFrame, resultados: Dict, 
+                             data_inicio_pandemia: str = '2020-03-01',
+                             data_fim_pandemia: str = '2021-12-31') -> Dict:
+    """
+    Análise específica do período da pandemia.
+    """
+    logger.info("\n🦠 ANÁLISE DO PERÍODO PANDEMIA")
+    logger.info("="*50)
+    
+    # Converter datas
+    data_inicio = pd.to_datetime(data_inicio_pandemia)
+    data_fim = pd.to_datetime(data_fim_pandemia)
+    
+    # Encontrar índices correspondentes
+    mask_pandemia = (df_merged['DATA'] >= data_inicio) & (df_merged['DATA'] <= data_fim)
+    indices_pandemia = df_merged[mask_pandemia].index
+    
+    if len(indices_pandemia) == 0:
+        logger.warning("⚠️  Período da pandemia não encontrado nos dados!")
+        return {}
+    
+    idx_inicio = indices_pandemia[0]
+    idx_fim = indices_pandemia[-1]
+    
+    logger.info(f"\n📅 Período analisado: {df_merged.loc[idx_inicio, 'DATA']} a {df_merged.loc[idx_fim, 'DATA']}")
+    logger.info(f"📊 Índices: {idx_inicio} a {idx_fim}")
+    
+    # Verificar detecções no período
+    deteccoes_pandemia = {}
+    
+    # Univariado
+    for var, res_var in resultados['univariado'].items():
+        deteccoes = res_var['deteccoes']
+        det_pandemia = [d for d in deteccoes if idx_inicio <= d <= idx_fim]
+        deteccoes_pandemia[var] = det_pandemia
+        
+        if det_pandemia:
+            primeira = min(det_pandemia)
+            data_det = df_merged.loc[primeira, 'DATA']
+            dias_apos_inicio = (data_det - data_inicio).days
+            logger.info(f"\n✓ {var}: {len(det_pandemia)} detecções")
+            logger.info(f"  Primeira detecção: {data_det} ({dias_apos_inicio} dias após início)")
+    
+    # Multivariado
+    det_multi = resultados['multivariado']['deteccoes']
+    det_multi_pandemia = [d for d in det_multi if idx_inicio <= d <= idx_fim]
+    
+    if det_multi_pandemia:
+        primeira_multi = min(det_multi_pandemia)
+        data_det_multi = df_merged.loc[primeira_multi, 'DATA']
+        dias_apos_multi = (data_det_multi - data_inicio).days
+        logger.info(f"\n✓ Multivariado: {len(det_multi_pandemia)} detecções")
+        logger.info(f"  Primeira detecção: {data_det_multi} ({dias_apos_multi} dias após início)")
+    
+    # Análise de sensibilidade
+    todas_deteccoes = []
+    
+    for var, dets in deteccoes_pandemia.items():
+        if dets:
+            todas_deteccoes.append((min(dets), f'Univariado-{var}'))
+    
+    if det_multi_pandemia:
+        todas_deteccoes.append((min(det_multi_pandemia), 'Multivariado'))
+    
+    if todas_deteccoes:
+        todas_deteccoes.sort(key=lambda x: x[0])
+        primeira_global = todas_deteccoes[0]
+        
+        logger.info(f"\n🏆 Detecção mais rápida: {primeira_global[1]}")
+        logger.info(f"   Índice: {primeira_global[0]}")
+        logger.info(f"   Data: {df_merged.loc[primeira_global[0], 'DATA']}")
+    
+    return {
+        'indices_periodo': (idx_inicio, idx_fim),
+        'deteccoes_por_variavel': deteccoes_pandemia,
+        'deteccoes_multivariado': det_multi_pandemia,
+        'primeira_deteccao': todas_deteccoes[0] if todas_deteccoes else None
+    }
+
+# ============================================================================
+# PARTE 14: FUNÇÃO PRINCIPAL COMPLETA
+# ============================================================================
+
+def main():
+    """
+    Executa análise completa com configurações customizáveis.
+    """
+    # Criar configuração
+    config = ConfiguracaoDrift(
+        agencia_analise=20,  # None para todas as agências
+        janela_deslizante=1000,  # Otimização de memória
+        janelas_analise=[7, 30, 90],
+        epsilon_power=0.92,
+        epsilon_range=(0.85, 0.95),  # Para otimização automática
+        scores_ativos=['mad', 'contextual', 'std'],  # Escolha modular
+        usar_otimizacao_memoria=True,
+        threshold_mult=20.0,
+        min_consecutivos=3,
+        periodo_calibracao=90
+    )
+    
+    try:
+        logger.info("🏁 INICIANDO ANÁLISE DE DRIFT - MODELO NUMERÁRIOS")
+        logger.info("="*60)
+        logger.info(f"Configuração:\n{json.dumps(config.__dict__, indent=2)}")
+        
+        # 1. Carregar dados
+        features_df, previsoes_df = carregar_dados(config=config)
+        
+        # 2. Combinar dados
+        df_merged = merge_real_previsto(features_df, previsoes_df, config)
+        
+        # 3. Executar análise completa
+        resultados = executar_analise_drift_otimizada(df_merged, config)
+        
+        # 4. Análise específica da pandemia
+        analise_pandemia = analisar_periodo_pandemia(df_merged, resultados)
+        
+        # 5. Salvar resultados
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Salvar resultados serializáveis
+        resultados_json = {
+            'config': resultados['config'],
+            'analise_comparativa': resultados['analise_comparativa'],
+            'resumo_deteccoes': {
+                'univariado': {
+                    var: {
+                        'n_deteccoes': len(res['deteccoes']),
+                        'deteccoes': res['deteccoes'][:10],  # Primeiras 10
+                        'melhor_score': res['melhor_score']
+                    }
+                    for var, res in resultados['univariado'].items()
+                },
+                'multivariado': {
+                    'n_deteccoes': len(resultados['multivariado']['deteccoes']),
+                    'deteccoes': resultados['multivariado']['deteccoes'][:10],
+                    'epsilon_usado': resultados['multivariado']['epsilon_usado'],
+                    'contribuicoes': resultados['multivariado'].get('contribuicoes', {})
+                }
+            },
+            'analise_pandemia': {
+                'periodo': [str(d) for d in analise_pandemia.get('indices_periodo', [])],
+                'primeira_deteccao': analise_pandemia.get('primeira_deteccao', None)
+            } if analise_pandemia else None
+        }
+        
+        with open(f'resultados_drift_{timestamp}.json', 'w') as f:
+            json.dump(resultados_json, f, indent=2, default=str)
+        logger.info(f"\n✓ Resultados salvos em resultados_drift_{timestamp}.json")
+        
+        # 6. Gerar visualizações
+        logger.info("\n📈 GERANDO VISUALIZAÇÕES...")
+        
+        # Criar diretório para salvar gráficos
+        os.makedirs('graficos', exist_ok=True)
+        
+        # Boxplot melhorado
+        for var in ['SAQ', 'DEP']:
+            plot_boxplot_erros_contexto_melhorado(
+                df_merged, 
+                variavel=var,
+                save_path=f'graficos/boxplot_erros_{var}_{timestamp}.png'
+            )
+        
+        # Dashboard modular - diferentes componentes
+        plot_dashboard_modular(
+            resultados,
+            df_merged,
+            componentes=['martingales'],
+            save_path=f'graficos/dashboard_martingales_{timestamp}.png'
+        )
+        
+        plot_dashboard_modular(
+            resultados,
+            df_merged,
+            componentes=['metricas', 'timeline'],
+            save_path=f'graficos/dashboard_metricas_timeline_{timestamp}.png'
+        )
+        
+        logger.info("\n✅ ANÁLISE CONCLUÍDA COM SUCESSO!")
+        
+        # 7. Imprimir resumo final
+        logger.info("\n" + "="*60)
+        logger.info("📋 RESUMO FINAL DA ANÁLISE")
+        logger.info("="*60)
+        
+        for var in ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']:
+            if var in resultados['univariado']:
+                res = resultados['univariado'][var]
+                logger.info(f"\n{var}:")
+                logger.info(f"  - Melhor score: {res['melhor_score']}")
+                logger.info(f"  - Total detecções: {len(res['deteccoes'])}")
+                if res['deteccoes']:
+                    logger.info(f"  - Primeira detecção: índice {res['deteccoes'][0]}")
+        
+        logger.info(f"\nAnálise Multivariada:")
+        logger.info(f"  - Total detecções: {len(resultados['multivariado']['deteccoes'])}")
+        if resultados['multivariado']['deteccoes']:
+            logger.info(f"  - Primeira detecção: índice {resultados['multivariado']['deteccoes'][0]}")
+        
+        if analise_pandemia and 'primeira_deteccao' in analise_pandemia and analise_pandemia['primeira_deteccao']:
+            logger.info(f"\n🦠 Pandemia:")
+            logger.info(f"  - Detectada por: {analise_pandemia['primeira_deteccao'][1]}")
+            logger.info(f"  - Índice: {analise_pandemia['primeira_deteccao'][0]}")
+        
+        return resultados, df_merged
+        
+    except Exception as e:
+        logger.error(f"❌ Erro na execução: {str(e)}", exc_info=True)
+        raise
+
+# ============================================================================
+# EXECUÇÃO
+# ============================================================================
+
+if __name__ == "__main__":
+    # Executar análise completa
+    resultados, df_merged = main()
