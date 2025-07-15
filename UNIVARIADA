@@ -1,0 +1,1062 @@
+# Análise de Drift no Modelo Numerários usando Método Conformal
+# =============================================================================
+# Este notebook implementa detecção de drift usando predição conformal
+# para o modelo de previsão de demanda de numerário (dinheiro físico)
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+from datetime import datetime, timedelta
+import warnings
+from scipy.spatial.distance import mahalanobis
+from scipy.linalg import pinv
+warnings.filterwarnings('ignore')
+
+# Configurações de visualização
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+plt.rcParams['figure.figsize'] = (12, 6)
+plt.rcParams['font.size'] = 10
+
+print("📚 Notebook de Análise Conformal - Modelo Numerários")
+print("=" * 60)
+print("Este notebook implementa detecção de drift usando o método conformal")
+print("para identificar quando o modelo está degradando.\n")
+
+# =============================================================================
+# PARTE 1: CONFIGURAÇÃO E PARÂMETROS
+# =============================================================================
+
+# Parâmetros globais do sistema
+EPSILON = 0.92  # Parâmetro do power martingale (0.85-0.92)
+THRESHOLD_MULT = 20  # Multiplicador do threshold (equivale a α = 0.05)
+MIN_CONSECUTIVOS = 3  # Mínimo de detecções consecutivas para confirmar drift
+JANELA_HISTORICO = 30  # Janela para cálculos históricos
+PERIODO_CALIBRACAO = 90  # Dias para calibração automática
+
+# Variáveis alvo do modelo
+VARIAVEIS_ALVO = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+
+print("⚙️ Parâmetros configurados:")
+print(f"  - Epsilon (ε): {EPSILON}")
+print(f"  - Threshold multiplicador: {THRESHOLD_MULT}")
+print(f"  - Detecções consecutivas mínimas: {MIN_CONSECUTIVOS}")
+print(f"  - Janela histórica: {JANELA_HISTORICO} dias")
+print(f"  - Período de calibração: {PERIODO_CALIBRACAO} dias\n")
+
+# =============================================================================
+# PARTE 2: CARREGAMENTO E PREPARAÇÃO DOS DADOS
+# =============================================================================
+
+def carregar_dados(path_features='features.parquet', 
+                   path_previsoes='previsoes_numerario_pre_pos_pandemia.csv'):
+    """
+    Carrega os dados de features e previsões do modelo Numerários.
+    
+    Esta função:
+    1. Carrega o arquivo parquet com features e valores reais
+    2. Carrega o CSV com as previsões do modelo
+    3. Padroniza nomes de colunas para garantir consistência
+    4. Converte tipos de dados apropriadamente
+    
+    Args:
+        path_features: Caminho para arquivo de features (parquet)
+        path_previsoes: Caminho para arquivo de previsões (csv)
+    
+    Returns:
+        features_df: DataFrame com features e valores reais
+        previsoes_df: DataFrame com previsões do modelo
+    """
+    print("📂 Carregando dados...")
+    
+    try:
+        # Carregar features (contém valores reais e features de calendário)
+        features_df = pd.read_parquet(path_features)
+        print(f"✓ Features carregadas: {features_df.shape[0]:,} registros, {features_df.shape[1]} colunas")
+        
+        # Carregar previsões
+        previsoes_df = pd.read_csv(path_previsoes)
+        
+        # Padronizar nomes de colunas para match com features
+        # No CSV as colunas têm nomes diferentes
+        previsoes_df = previsoes_df.rename(columns={
+            'DEP_CEI': 'DEPCEI',
+            'DEPOSITO': 'DEP', 
+            'SAQUE': 'SAQ',
+            'SAQUE_CEI': 'SAQCEI'
+        })
+        
+        # Converter datas para datetime
+        features_df['DATA'] = pd.to_datetime(features_df['DATA'])
+        previsoes_df['DATA'] = pd.to_datetime(previsoes_df['DATA'])
+        previsoes_df['DATA_PREVISAO'] = pd.to_datetime(previsoes_df['DATA_PREVISAO'])
+        previsoes_df['DATA_REFERENCIA'] = pd.to_datetime(previsoes_df['DATA_REFERENCIA'])
+        
+        print(f"✓ Previsões carregadas: {previsoes_df.shape[0]:,} registros")
+        
+        # Verificar agências disponíveis
+        agencias_features = features_df['AGENCIA'].unique()
+        agencias_previsoes = previsoes_df['AGENCIA'].unique()
+        agencias_comuns = set(agencias_features) & set(agencias_previsoes)
+        
+        print(f"\n📊 Resumo dos dados:")
+        print(f"  - Agências em features: {len(agencias_features)}")
+        print(f"  - Agências em previsões: {len(agencias_previsoes)}")
+        print(f"  - Agências em comum: {len(agencias_comuns)}")
+        print(f"  - Período features: {features_df['DATA'].min()} a {features_df['DATA'].max()}")
+        print(f"  - Período previsões: {previsoes_df['DATA'].min()} a {previsoes_df['DATA'].max()}")
+        
+    except Exception as e:
+        print(f"❌ Erro ao carregar dados: {e}")
+        return None, None
+    
+    return features_df, previsoes_df
+
+def preparar_dados_agencia(features_df, previsoes_df, agencia_id):
+    """
+    Prepara os dados para análise de uma agência específica.
+    
+    Esta função realiza o merge entre valores reais e previstos,
+    alinhando temporalmente e incluindo todas as features de contexto.
+    
+    Args:
+        features_df: DataFrame com features e valores reais
+        previsoes_df: DataFrame com previsões
+        agencia_id: ID da agência para análise
+    
+    Returns:
+        df_agencia: DataFrame preparado para análise ou None se agência não encontrada
+    """
+    print(f"\n🏦 Preparando dados da agência {agencia_id}...")
+    
+    # Filtrar dados da agência
+    features_agencia = features_df[features_df['AGENCIA'] == agencia_id].copy()
+    previsoes_agencia = previsoes_df[previsoes_df['AGENCIA'] == agencia_id].copy()
+    
+    if len(features_agencia) == 0 or len(previsoes_agencia) == 0:
+        print(f"❌ Agência {agencia_id} não encontrada nos dados!")
+        return None
+    
+    # Preparar dados reais (features contém os valores reais)
+    df_real = features_agencia[['DATA'] + VARIAVEIS_ALVO].copy()
+    for var in VARIAVEIS_ALVO:
+        df_real[f'{var}_REAL'] = df_real[var]
+    df_real = df_real.drop(columns=VARIAVEIS_ALVO)
+    
+    # Preparar dados previstos
+    df_prev = previsoes_agencia[['DATA', 'DATA_PREVISAO', 'DATA_REFERENCIA'] + VARIAVEIS_ALVO].copy()
+    for var in VARIAVEIS_ALVO:
+        df_prev[f'{var}_PREV'] = df_prev[var]
+    df_prev = df_prev.drop(columns=VARIAVEIS_ALVO)
+    
+    # Merge por data
+    df_merged = pd.merge(df_real, df_prev, on='DATA', how='inner')
+    
+    # Adicionar features de calendário
+    features_calendario = [col for col in features_agencia.columns 
+                          if col not in ['AGENCIA', 'DATA'] + VARIAVEIS_ALVO]
+    
+    if features_calendario:
+        df_merged = pd.merge(df_merged, 
+                           features_agencia[['DATA'] + features_calendario],
+                           on='DATA', 
+                           how='left')
+    
+    # Ordenar por data e resetar índice
+    df_merged = df_merged.sort_values('DATA').reset_index(drop=True)
+    
+    print(f"✓ Dados preparados: {len(df_merged)} registros")
+    print(f"  - Período: {df_merged['DATA'].min()} a {df_merged['DATA'].max()}")
+    print(f"  - Features de calendário: {len(features_calendario)}")
+    
+    return df_merged
+
+# =============================================================================
+# PARTE 3: IMPLEMENTAÇÃO DOS SCORES DE NÃO-CONFORMIDADE
+# =============================================================================
+
+class ScoresNaoConformidade:
+    """
+    Classe que implementa os 8 diferentes scores de não-conformidade.
+    
+    Cada score tem características específicas:
+    - Alguns são mais sensíveis a mudanças abruptas (MAD)
+    - Outros capturam mudanças graduais (Z-score)
+    - Alguns consideram contexto (contextual, multi-contextual)
+    
+    A ideia é que diferentes tipos de drift sejam melhor detectados
+    por diferentes scores, por isso implementamos todos.
+    """
+    
+    def __init__(self, janela_historico=30, epsilon=1e-8):
+        """
+        Args:
+            janela_historico: Tamanho da janela para cálculos históricos
+            epsilon: Termo pequeno para evitar divisão por zero
+        """
+        self.janela_historico = janela_historico
+        self.epsilon = epsilon
+        
+    def calcular_todos_scores(self, real, previsto, contexto_features=None, 
+                            variavel_nome='', df_completo=None):
+        """
+        Calcula todos os 8 scores de não-conformidade.
+        
+        Esta é a função principal que orquestra o cálculo de todos os scores.
+        Cada score captura diferentes aspectos da não-conformidade.
+        
+        Args:
+            real: Array com valores reais
+            previsto: Array com valores previstos
+            contexto_features: DataFrame com features de contexto (opcional)
+            variavel_nome: Nome da variável sendo analisada
+            df_completo: DataFrame completo para análises contextuais
+            
+        Returns:
+            dict: Dicionário com todos os scores calculados
+        """
+        print(f"    Calculando 8 scores de não-conformidade para {variavel_nome}...")
+        
+        scores = {}
+        
+        # A. Erro Absoluto Simples - baseline mais direto
+        scores['abs'] = self.score_absoluto(real, previsto)
+        
+        # B. Erro Relativo - normaliza pela magnitude
+        scores['rel'] = self.score_relativo(real, previsto)
+        
+        # C. Erro Padronizado (Z-score) - considera variabilidade histórica
+        scores['std'] = self.score_padronizado(real, previsto)
+        
+        # D. Erro Normalizado por MAD - robusto a outliers
+        scores['mad'] = self.score_mad(real, previsto)
+        
+        # E. Distância Mínima - detecta novidade
+        scores['min'] = self.score_distancia_minima(real, previsto)
+        
+        # F. Distância Média - mais estável que mínima
+        scores['mean'] = self.score_distancia_media(real, previsto)
+        
+        # G. Score Contextual - considera tipo de dia
+        if contexto_features is not None and len(contexto_features) > 0:
+            scores['contexto'] = self.score_contextual(real, previsto, 
+                                                      contexto_features,
+                                                      df_completo)
+        
+        # H. Score Multi-contextual - análise multivariada de contexto
+        if contexto_features is not None and len(contexto_features.columns) > 1:
+            scores['multi_contexto'] = self.score_multi_contextual(
+                real, previsto, contexto_features, df_completo
+            )
+        
+        return scores
+    
+    def score_absoluto(self, real, previsto):
+        """
+        Score A: Erro Absoluto Simples
+        
+        O mais direto dos scores. Útil como baseline.
+        Vantagem: Simples e interpretável
+        Desvantagem: Não normalizado, sensível à escala
+        """
+        return np.abs(real - previsto)
+    
+    def score_relativo(self, real, previsto):
+        """
+        Score B: Erro Relativo
+        
+        Normaliza o erro pela magnitude do valor real.
+        Vantagem: Comparável entre diferentes escalas
+        Desvantagem: Pode amplificar erros quando real é pequeno
+        """
+        return np.abs(real - previsto) / (np.abs(real) + self.epsilon)
+    
+    def score_padronizado(self, real, previsto):
+        """
+        Score C: Erro Padronizado (Z-score)
+        
+        Normaliza pelo desvio padrão histórico.
+        Detecta bem quando o erro sai do padrão histórico.
+        """
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        
+        for i in range(len(erros)):
+            if i >= self.janela_historico:
+                # Usa janela completa
+                historico = erros[i-self.janela_historico:i]
+                std_hist = np.std(historico)
+                if std_hist > 0:
+                    scores[i] = np.abs(erros[i]) / std_hist
+                else:
+                    scores[i] = np.abs(erros[i])
+            else:
+                # Início da série - usa dados disponíveis
+                if i > 0:
+                    historico = erros[:i]
+                    std_hist = np.std(historico)
+                    if std_hist > 0:
+                        scores[i] = np.abs(erros[i]) / std_hist
+                    else:
+                        scores[i] = np.abs(erros[i])
+                else:
+                    scores[i] = 0
+                    
+        return scores
+    
+    def score_mad(self, real, previsto):
+        """
+        Score D: Erro Normalizado por MAD (Median Absolute Deviation)
+        
+        MAD é mais robusto a outliers que desvio padrão.
+        Excelente para detectar mudanças em dados com outliers ocasionais.
+        O fator 1.4826 converte MAD para escala comparável ao desvio padrão.
+        """
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        
+        for i in range(len(erros)):
+            if i >= self.janela_historico:
+                historico = erros[i-self.janela_historico:i]
+                mad = np.median(np.abs(historico - np.median(historico)))
+                scores[i] = np.abs(erros[i]) / (1.4826 * mad + self.epsilon)
+            else:
+                if i > 0:
+                    historico = erros[:i]
+                    mad = np.median(np.abs(historico - np.median(historico)))
+                    scores[i] = np.abs(erros[i]) / (1.4826 * mad + self.epsilon)
+                else:
+                    scores[i] = 0
+                    
+        return scores
+    
+    def score_distancia_minima(self, real, previsto):
+        """
+        Score E: Distância Mínima aos erros históricos
+        
+        Inspirado no método conformal original.
+        Detecta quando aparece um erro "novo", diferente dos vistos antes.
+        """
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        
+        for i in range(len(erros)):
+            if i > 0:
+                # Distância mínima aos erros anteriores
+                historico = erros[:i]
+                distancias = np.abs(erros[i] - historico)
+                scores[i] = np.min(distancias)
+            else:
+                scores[i] = 0
+                
+        return scores
+    
+    def score_distancia_media(self, real, previsto):
+        """
+        Score F: Distância Média aos erros históricos
+        
+        Versão mais estável da distância mínima.
+        Menos sensível a outliers individuais no histórico.
+        """
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        
+        for i in range(len(erros)):
+            if i > 0:
+                historico = erros[:i]
+                distancias = np.abs(erros[i] - historico)
+                scores[i] = np.mean(distancias)
+            else:
+                scores[i] = 0
+                
+        return scores
+    
+    def score_contextual(self, real, previsto, contexto_features, df_completo):
+        """
+        Score G: Score Contextual por Tipo de Dia
+        
+        Compara erro apenas com dias similares (mesmo dia da semana,
+        feriados com feriados, etc.). Captura mudanças em padrões específicos.
+        """
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        
+        # Priorizar features mais relevantes para contexto bancário
+        features_prioritarias = ['DIA_SEMANA', 'DIA_FERIADO', 'SEMANA_QUINTO_DU']
+        
+        # Escolher feature de contexto principal
+        tipo_contexto = None
+        for feat in features_prioritarias:
+            if feat in contexto_features.columns:
+                tipo_contexto = contexto_features[feat].values
+                break
+        
+        if tipo_contexto is None and len(contexto_features.columns) > 0:
+            # Usar primeira feature disponível
+            tipo_contexto = contexto_features.iloc[:, 0].values
+        
+        if tipo_contexto is not None:
+            for i in range(len(erros)):
+                if i >= self.janela_historico:
+                    # Encontrar dias similares no histórico
+                    janela_inicio = max(0, i - self.janela_historico)
+                    mask_similar = tipo_contexto[janela_inicio:i] == tipo_contexto[i]
+                    
+                    if np.any(mask_similar):
+                        historico_similar = erros[janela_inicio:i][mask_similar]
+                        if len(historico_similar) > 0:
+                            mad = np.median(np.abs(historico_similar - np.median(historico_similar)))
+                            scores[i] = np.abs(erros[i]) / (1.4826 * mad + self.epsilon)
+                        else:
+                            scores[i] = np.abs(erros[i])
+                    else:
+                        scores[i] = np.abs(erros[i])
+                else:
+                    scores[i] = np.abs(erros[i])
+        else:
+            # Sem contexto, usar erro absoluto
+            scores = np.abs(erros)
+                
+        return scores
+    
+    def score_multi_contextual(self, real, previsto, contexto_features, df_completo):
+        """
+        Score H: Score Multi-contextual usando Distância de Mahalanobis
+        
+        Considera múltiplas features de contexto simultaneamente.
+        Mais sofisticado mas computacionalmente mais intensivo.
+        """
+        erros = real - previsto
+        scores = np.zeros_like(erros, dtype=float)
+        
+        # Features importantes para contexto bancário
+        features_importantes = ['DIA_SEMANA', 'SEMANA_QUINTO_DU', 'DIA_FERIADO', 
+                               'DIA_UTIL', 'EMENDA', 'DIA_ADJACENTE_FERIADO']
+        
+        # Selecionar features disponíveis
+        features_disponiveis = [f for f in features_importantes if f in contexto_features.columns]
+        
+        if len(features_disponiveis) >= 2:  # Precisamos de pelo menos 2 features
+            X_contexto = contexto_features[features_disponiveis].values
+            
+            for i in range(len(erros)):
+                if i >= self.janela_historico:
+                    # Contexto histórico
+                    janela_inicio = i - self.janela_historico
+                    X_hist = X_contexto[janela_inicio:i]
+                    erros_hist = erros[janela_inicio:i]
+                    
+                    # Calcular covariância e distância
+                    if len(X_hist) > len(features_disponiveis):
+                        try:
+                            cov_matrix = np.cov(X_hist.T)
+                            # Usar pseudo-inversa para matrizes singulares
+                            inv_cov = pinv(cov_matrix)
+                            centro = np.mean(X_hist, axis=0)
+                            
+                            # Distância de Mahalanobis do contexto atual
+                            dist = mahalanobis(X_contexto[i], centro, inv_cov)
+                            
+                            # Ponderar erro pela distância contextual
+                            # Quanto mais diferente o contexto, maior o peso
+                            scores[i] = np.abs(erros[i]) * (1 + dist/10)
+                        except:
+                            # Em caso de erro, usar score MAD
+                            scores[i] = np.abs(erros[i])
+                    else:
+                        scores[i] = np.abs(erros[i])
+                else:
+                    scores[i] = np.abs(erros[i])
+        else:
+            # Poucos features, usar erro absoluto
+            scores = np.abs(erros)
+            
+        return scores
+
+# =============================================================================
+# PARTE 4: CÁLCULO DE P-VALORES CONFORMAIS
+# =============================================================================
+
+def calcular_pvalores_score(scores, rtol=1e-3, atol=1e-3):
+    """
+    Calcula p-valores conformais para um array de scores.
+    
+    O p-valor conformal mede quão "conforme" uma observação é
+    comparada com o histórico. P-valores baixos indicam não-conformidade.
+    
+    Args:
+        scores: Array de scores de não-conformidade
+        rtol, atol: Tolerâncias para comparação numérica
+        
+    Returns:
+        p_det: P-valores determinísticos
+        p_rnd: P-valores randomizados (mais precisos para dados discretos)
+    """
+    N = len(scores)
+    p_det = np.zeros(N)
+    p_rnd = np.zeros(N)
+    
+    for n in range(N):
+        if n == 0:
+            # Primeira observação sempre tem p-valor = 1
+            p_det[0] = 1
+            p_rnd[0] = 1
+            continue
+        
+        score_atual = scores[n]
+        scores_anteriores = scores[:n+1]  # Inclui o atual
+        
+        # P-valor determinístico
+        # Proporção de scores históricos >= score atual
+        p_det[n] = np.mean(scores_anteriores >= score_atual)
+        
+        # P-valor randomizado
+        # Trata empates de forma mais precisa
+        count_maior = np.sum(scores_anteriores > score_atual)
+        count_igual = np.sum(np.isclose(scores_anteriores, score_atual, rtol=rtol, atol=atol))
+        
+        # Componente aleatório para empates
+        u = np.random.uniform() if count_igual > 0 else 0
+        p_rnd[n] = (count_maior + u * count_igual) / (n + 1)
+    
+    return p_det, p_rnd
+
+# =============================================================================
+# PARTE 5: MARTINGALES PARA DETECÇÃO
+# =============================================================================
+
+def power_martingale(p_values, epsilon=0.92):
+    """
+    Calcula Power Martingale a partir de p-valores.
+    
+    O Power Martingale é uma sequência que:
+    - Permanece estável (em torno de 1) quando não há drift
+    - Cresce exponencialmente quando há drift
+    
+    Args:
+        p_values: Array de p-valores conformais
+        epsilon: Parâmetro de sensibilidade (0.85-0.92 recomendado)
+        
+    Returns:
+        M: Array com valores do martingale
+    """
+    # Evitar p-valores exatamente zero (causariam divisão por zero)
+    p_values = np.maximum(p_values, 1e-10)
+    
+    # Power martingale: M_n = ∏(ε * p_i^(ε-1))
+    betting = epsilon * (p_values ** (epsilon - 1))
+    M = np.cumprod(betting)
+    
+    return M
+
+def simple_jumper_martingale(p_values, J=0.01):
+    """
+    Simple Jumper Martingale - estratégia adaptativa.
+    
+    Mantém 3 "apostadores" com diferentes estratégias que
+    se adaptam dinamicamente. Mais robusto a diferentes tipos de drift.
+    
+    Args:
+        p_values: Array de p-valores (0 < p <= 1)
+        J: Probabilidade de mudar de estratégia (jumper)
+        
+    Returns:
+        capital: Array com valores do martingale
+    """
+    n = len(p_values)
+    capital = np.zeros(n + 1)
+    capital[0] = 1.0  # Capital inicial
+    
+    # Capital inicial para cada estratégia
+    # Três estratégias: conservadora (-1), neutra (0), agressiva (1)
+    C = {epsilon: 1/3 for epsilon in [-1, 0, 1]}
+    
+    for i in range(n):
+        # Etapa 1: Transição (Markov chain)
+        # Permite que estratégias troquem capital
+        C_new = {}
+        total = sum(C.values())
+        for epsilon in [-1, 0, 1]:
+            C_new[epsilon] = (1 - J) * C[epsilon] + J * total / 3
+        
+        # Etapa 2: Atualizar capital com função de aposta
+        p = p_values[i]
+        for epsilon in [-1, 0, 1]:
+            # Função de aposta: f(p) = 1 + ε(p - 0.5)
+            f_eps = 1 + epsilon * (p - 0.5)
+            C_new[epsilon] *= f_eps
+        
+        # Capital total é a soma dos três
+        capital[i + 1] = sum(C_new.values())
+        C = C_new
+    
+    return capital[1:]  # Retorna S_1 até S_n
+
+# =============================================================================
+# PARTE 6: DETECÇÃO DE MUDANÇA
+# =============================================================================
+
+def detectar_mudanca_adaptativa(martingale, datas, janela=30, 
+                               threshold_mult=20, min_consecutivos=3, 
+                               periodo_calibracao=90):
+    """
+    Detecta mudanças usando threshold adaptativo.
+    
+    A calibração automática usa o período inicial para estabelecer
+    um baseline do comportamento normal do martingale.
+    
+    Args:
+        martingale: Array com valores do martingale
+        datas: Array de datas correspondentes
+        janela: Tamanho da janela para análise local
+        threshold_mult: Multiplicador do threshold (1/α)
+        min_consecutivos: Detecções consecutivas necessárias
+        periodo_calibracao: Dias iniciais para calibração
+        
+    Returns:
+        deteccoes: Lista de tuplas (índice, data) de detecções
+        info: Dicionário com informações adicionais
+    """
+    deteccoes = []
+    indices_deteccao = []
+    alarmes_consecutivos = 0
+    
+    # Calibração automática do threshold
+    if len(martingale) > periodo_calibracao:
+        # Usar percentil 95 do período de calibração como base
+        baseline = martingale[:periodo_calibracao]
+        threshold_base = np.percentile(baseline, 95) * threshold_mult
+        print(f"      Threshold calibrado automaticamente: {threshold_base:.2f}")
+    else:
+        # Fallback para threshold fixo se não há dados suficientes
+        threshold_base = threshold_mult
+        print(f"      Usando threshold padrão: {threshold_base}")
+    
+    # Análise temporal
+    for i in range(janela, len(martingale)):
+        # Verificar se martingale excede threshold
+        if martingale[i] > threshold_base:
+            alarmes_consecutivos += 1
+            
+            if alarmes_consecutivos >= min_consecutivos:
+                # Evitar detecções muito próximas
+                if len(indices_deteccao) == 0 or i - indices_deteccao[-1] > janela:
+                    indices_deteccao.append(i)
+                    deteccoes.append((i, datas[i]))
+                    print(f"      ⚠️  Drift detectado! Índice: {i}, Data: {datas[i].strftime('%Y-%m-%d')}")
+        else:
+            alarmes_consecutivos = 0
+    
+    # Calcular métricas adicionais
+    taxas_crescimento = []
+    for i in range(janela, len(martingale)):
+        janela_valores = martingale[i-janela:i]
+        if len(janela_valores) > 1 and janela_valores[0] > 0:
+            taxa = (janela_valores[-1] / janela_valores[0]) - 1
+            taxas_crescimento.append(taxa)
+        else:
+            taxas_crescimento.append(0)
+    
+    info = {
+        'threshold_calibrado': threshold_base,
+        'max_martingale': np.max(martingale),
+        'taxas_crescimento': taxas_crescimento,
+        'total_deteccoes': len(deteccoes),
+        'primeira_deteccao': deteccoes[0] if deteccoes else None
+    }
+    
+    return deteccoes, info
+
+# =============================================================================
+# PARTE 7: VISUALIZAÇÕES
+# =============================================================================
+
+def criar_dashboard_univariado(resultados_variavel, variavel_nome, df_agencia):
+    """
+    Cria um dashboard completo para análise univariada.
+    
+    Mostra:
+    1. Evolução dos martingales para cada score
+    2. Comparação de sensibilidade dos scores
+    3. Timeline de detecções
+    4. Análise de erro por contexto
+    """
+    fig = plt.figure(figsize=(20, 16))
+    
+    # Layout do dashboard
+    gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
+    
+    # 1. Martingales Power (2x2 grid no topo)
+    scores_nomes = list(resultados_variavel['scores'].keys())
+    cores = plt.cm.tab10(np.linspace(0, 1, len(scores_nomes)))
+    
+    for idx, score_nome in enumerate(scores_nomes[:4]):  # Primeiros 4 scores
+        ax = fig.add_subplot(gs[0, idx//2], gs[0, idx%2])
+        
+        martingale = resultados_variavel['martingales_power'][score_nome]
+        deteccoes = resultados_variavel['deteccoes'][score_nome]
+        
+        ax.plot(martingale, label=f'Score: {score_nome}', color=cores[idx], linewidth=2)
+        ax.set_yscale('log')
+        
+        # Marcar detecções
+        for det_idx, det_data in deteccoes:
+            ax.axvline(det_idx, color='red', linestyle='--', alpha=0.7)
+        
+        ax.set_xlabel('Tempo')
+        ax.set_ylabel('Martingale (log)')
+        ax.set_title(f'Power Martingale - {score_nome}')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    
+    # 2. Comparação de todos os martingales
+    ax_comp = fig.add_subplot(gs[1, :])
+    
+    for idx, score_nome in enumerate(scores_nomes):
+        martingale = resultados_variavel['martingales_power'][score_nome]
+        ax_comp.plot(martingale, label=score_nome, color=cores[idx], 
+                    alpha=0.7, linewidth=1.5)
+    
+    ax_comp.set_yscale('log')
+    ax_comp.set_xlabel('Tempo')
+    ax_comp.set_ylabel('Martingale (log)')
+    ax_comp.set_title(f'Comparação de Todos os Scores - {variavel_nome}')
+    ax_comp.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax_comp.grid(True, alpha=0.3)
+    
+    # 3. Métricas de desempenho
+    ax_metrics = fig.add_subplot(gs[2, 0])
+    
+    max_values = []
+    n_deteccoes = []
+    primeira_det = []
+    
+    for score_nome in scores_nomes:
+        max_values.append(np.max(resultados_variavel['martingales_power'][score_nome]))
+        n_deteccoes.append(len(resultados_variavel['deteccoes'][score_nome]))
+        
+        if resultados_variavel['deteccoes'][score_nome]:
+            primeira_det.append(resultados_variavel['deteccoes'][score_nome][0][0])
+        else:
+            primeira_det.append(len(df_agencia))  # Sem detecção
+    
+    # Barplot de máximo martingale
+    x = np.arange(len(scores_nomes))
+    ax_metrics.bar(x, max_values, color=cores)
+    ax_metrics.set_yscale('log')
+    ax_metrics.set_xticks(x)
+    ax_metrics.set_xticklabels(scores_nomes, rotation=45)
+    ax_metrics.set_ylabel('Máximo Martingale (log)')
+    ax_metrics.set_title('Intensidade Máxima por Score')
+    
+    # 4. Número de detecções
+    ax_detec = fig.add_subplot(gs[2, 1])
+    ax_detec.bar(x, n_deteccoes, color=cores)
+    ax_detec.set_xticks(x)
+    ax_detec.set_xticklabels(scores_nomes, rotation=45)
+    ax_detec.set_ylabel('Número de Detecções')
+    ax_detec.set_title('Total de Detecções por Score')
+    
+    # 5. Tempo até primeira detecção
+    ax_tempo = fig.add_subplot(gs[2, 2])
+    ax_tempo.bar(x, primeira_det, color=cores)
+    ax_tempo.set_xticks(x)
+    ax_tempo.set_xticklabels(scores_nomes, rotation=45)
+    ax_tempo.set_ylabel('Índice da Primeira Detecção')
+    ax_tempo.set_title('Rapidez de Detecção (menor = melhor)')
+    ax_tempo.axhline(y=len(df_agencia), color='red', linestyle=':', 
+                     label='Sem detecção')
+    
+    # 6. Timeline de detecções
+    ax_timeline = fig.add_subplot(gs[3, :])
+    
+    # Criar timeline
+    tempo = np.arange(len(df_agencia))
+    ax_timeline.scatter(tempo, np.zeros_like(tempo), alpha=0.1, s=1, c='gray')
+    
+    # Marcar detecções de cada score
+    for idx, score_nome in enumerate(scores_nomes):
+        deteccoes = resultados_variavel['deteccoes'][score_nome]
+        if deteccoes:
+            indices = [d[0] for d in deteccoes]
+            ax_timeline.scatter(indices, [idx+1]*len(indices), 
+                              label=score_nome, s=100, alpha=0.7, c=cores[idx])
+    
+    ax_timeline.set_ylim(-0.5, len(scores_nomes)+0.5)
+    ax_timeline.set_xlabel('Tempo')
+    ax_timeline.set_yticks(range(len(scores_nomes)+1))
+    ax_timeline.set_yticklabels([''] + scores_nomes)
+    ax_timeline.set_title(f'Timeline de Detecções - {variavel_nome}')
+    ax_timeline.grid(True, axis='x', alpha=0.3)
+    
+    plt.suptitle(f'Dashboard de Análise Univariada - {variavel_nome}', fontsize=18)
+    plt.tight_layout()
+    plt.show()
+
+def plotar_analise_erro_contexto(df_agencia, variavel):
+    """
+    Analisa o comportamento do erro em diferentes contextos.
+    
+    Ajuda a entender se o drift afeta igualmente todos os contextos
+    ou se é específico de certas situações (ex: feriados, fins de semana).
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    axes = axes.flatten()
+    
+    # Calcular erro
+    erro = df_agencia[f'{variavel}_REAL'] - df_agencia[f'{variavel}_PREV']
+    erro_rel = erro / (df_agencia[f'{variavel}_REAL'] + 1e-8)
+    
+    # Contextos importantes para análise bancária
+    contextos = [
+        ('DIA_SEMANA', 'Dia da Semana', None),
+        ('DIA_FERIADO', 'Feriado', {0: 'Não', 1: 'Sim'}),
+        ('SEMANA_QUINTO_DU', '5º Dia Útil', {0: 'Não', 1: 'Sim'}),
+        ('EMENDA', 'Emenda de Feriado', {0: 'Não', 1: 'Sim'})
+    ]
+    
+    for idx, (feature, titulo, labels_map) in enumerate(contextos):
+        if idx >= len(axes):
+            break
+            
+        ax = axes[idx]
+        
+        if feature in df_agencia.columns:
+            # Preparar dados
+            data_plot = pd.DataFrame({
+                'Erro_Relativo': erro_rel,
+                feature: df_agencia[feature]
+            })
+            
+            # Aplicar mapeamento se fornecido
+            if labels_map:
+                data_plot[feature] = data_plot[feature].map(labels_map).fillna('Outro')
+            
+            # Boxplot
+            data_plot.boxplot(column='Erro_Relativo', by=feature, ax=ax)
+            ax.set_title(f'Erro Relativo por {titulo}')
+            ax.set_xlabel(titulo)
+            ax.set_ylabel('Erro Relativo')
+            ax.set_ylim(-2, 2)  # Limitar para melhor visualização
+    
+    plt.suptitle(f'Análise de Erro por Contexto - {variavel}', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+
+# =============================================================================
+# PARTE 8: FUNÇÃO PRINCIPAL DE ANÁLISE
+# =============================================================================
+
+def analisar_drift_univariado(df_agencia, variavel, 
+                             epsilon=EPSILON, 
+                             threshold_mult=THRESHOLD_MULT,
+                             min_consecutivos=MIN_CONSECUTIVOS,
+                             janela_historico=JANELA_HISTORICO,
+                             periodo_calibracao=PERIODO_CALIBRACAO):
+    """
+    Executa análise completa de drift para uma variável específica.
+    
+    Esta é a função principal que orquestra toda a análise univariada,
+    calculando todos os scores, p-valores, martingales e detectando drift.
+    
+    Args:
+        df_agencia: DataFrame com dados da agência
+        variavel: Nome da variável a analisar (SAQ, DEP, etc.)
+        epsilon: Parâmetro do power martingale
+        threshold_mult: Multiplicador do threshold
+        min_consecutivos: Detecções consecutivas mínimas
+        janela_historico: Janela para cálculos históricos
+        periodo_calibracao: Período para calibração automática
+        
+    Returns:
+        resultados: Dicionário com todos os resultados da análise
+    """
+    print(f"\n📊 Analisando {variavel}...")
+    
+    # Extrair valores reais e previstos
+    real = df_agencia[f'{variavel}_REAL'].values
+    previsto = df_agencia[f'{variavel}_PREV'].values
+    datas = df_agencia['DATA'].values
+    
+    # Features de contexto
+    features_contexto = [col for col in df_agencia.columns 
+                        if col.startswith(('DIA_', 'SEMANA_', 'QTD_', 
+                                         'NUM_', 'EMENDA', 'FDS_'))]
+    
+    contexto_df = df_agencia[features_contexto] if features_contexto else None
+    
+    # Instanciar calculador de scores
+    calculador = ScoresNaoConformidade(janela_historico=janela_historico)
+    
+    # Calcular todos os scores
+    scores_dict = calculador.calcular_todos_scores(
+        real, previsto, contexto_df, variavel, df_agencia
+    )
+    
+    # Armazenar resultados
+    resultados = {
+        'variavel': variavel,
+        'scores': scores_dict,
+        'p_valores': {},
+        'martingales_power': {},
+        'martingales_jumper': {},
+        'deteccoes': {},
+        'info_deteccoes': {}
+    }
+    
+    # Para cada score, calcular p-valores e martingales
+    for score_nome, score_valores in scores_dict.items():
+        print(f"    Processando score: {score_nome}")
+        
+        # Calcular p-valores
+        p_det, p_rnd = calcular_pvalores_score(score_valores)
+        
+        # Power martingale (usando p-valores randomizados)
+        mart_power = power_martingale(p_rnd, epsilon)
+        
+        # Simple jumper martingale
+        mart_jumper = simple_jumper_martingale(p_rnd)
+        
+        # Detectar mudanças
+        deteccoes, info = detectar_mudanca_adaptativa(
+            mart_power, datas, 
+            janela=janela_historico,
+            threshold_mult=threshold_mult,
+            min_consecutivos=min_consecutivos,
+            periodo_calibracao=periodo_calibracao
+        )
+        
+        # Armazenar resultados
+        resultados['p_valores'][score_nome] = {'det': p_det, 'rnd': p_rnd}
+        resultados['martingales_power'][score_nome] = mart_power
+        resultados['martingales_jumper'][score_nome] = mart_jumper
+        resultados['deteccoes'][score_nome] = deteccoes
+        resultados['info_deteccoes'][score_nome] = info
+        
+        if deteccoes:
+            print(f"      ✓ {len(deteccoes)} detecções encontradas")
+        else:
+            print(f"      ✓ Nenhuma detecção")
+    
+    return resultados
+
+# =============================================================================
+# PARTE 9: PIPELINE COMPLETO DE EXECUÇÃO
+# =============================================================================
+
+def executar_analise_completa(agencia_id=None):
+    """
+    Pipeline completo de análise de drift.
+    
+    Esta função:
+    1. Carrega os dados
+    2. Permite seleção de agência
+    3. Executa análise para cada variável
+    4. Gera visualizações
+    5. Produz relatório resumido
+    """
+    print("\n" + "="*60)
+    print("🚀 INICIANDO ANÁLISE DE DRIFT - MÉTODO CONFORMAL")
+    print("="*60)
+    
+    # Carregar dados
+    features_df, previsoes_df = carregar_dados()
+    
+    if features_df is None or previsoes_df is None:
+        print("❌ Erro ao carregar dados. Verifique os arquivos.")
+        return None
+    
+    # Seleção de agência
+    if agencia_id is None:
+        agencias_disponiveis = sorted(set(features_df['AGENCIA'].unique()) & 
+                                    set(previsoes_df['AGENCIA'].unique()))
+        
+        print(f"\n📍 Agências disponíveis: {agencias_disponiveis[:10]}")
+        if len(agencias_disponiveis) > 10:
+            print(f"   ... e mais {len(agencias_disponiveis)-10} agências")
+        
+        agencia_id = int(input("\nDigite o ID da agência para análise: "))
+    
+    # Preparar dados da agência
+    df_agencia = preparar_dados_agencia(features_df, previsoes_df, agencia_id)
+    
+    if df_agencia is None:
+        return None
+    
+    # Executar análise para cada variável
+    resultados_completos = {
+        'agencia_id': agencia_id,
+        'periodo': f"{df_agencia['DATA'].min()} a {df_agencia['DATA'].max()}",
+        'n_observacoes': len(df_agencia),
+        'variaveis': {}
+    }
+    
+    for variavel in VARIAVEIS_ALVO:
+        resultados_var = analisar_drift_univariado(df_agencia, variavel)
+        resultados_completos['variaveis'][variavel] = resultados_var
+        
+        # Criar dashboard para a variável
+        print(f"\n📈 Gerando visualizações para {variavel}...")
+        criar_dashboard_univariado(resultados_var, variavel, df_agencia)
+        
+        # Análise de erro por contexto
+        plotar_analise_erro_contexto(df_agencia, variavel)
+    
+    # Relatório resumido
+    print("\n" + "="*60)
+    print("📋 RELATÓRIO RESUMIDO DA ANÁLISE")
+    print("="*60)
+    print(f"\nAgência: {agencia_id}")
+    print(f"Período: {resultados_completos['periodo']}")
+    print(f"Observações: {resultados_completos['n_observacoes']}")
+    
+    for variavel in VARIAVEIS_ALVO:
+        print(f"\n{variavel}:")
+        resultados_var = resultados_completos['variaveis'][variavel]
+        
+        # Encontrar score com detecção mais rápida
+        primeira_deteccao_por_score = {}
+        for score_nome, deteccoes in resultados_var['deteccoes'].items():
+            if deteccoes:
+                primeira_deteccao_por_score[score_nome] = deteccoes[0][0]
+        
+        if primeira_deteccao_por_score:
+            melhor_score = min(primeira_deteccao_por_score, 
+                             key=primeira_deteccao_por_score.get)
+            print(f"  - Score mais sensível: {melhor_score}")
+            print(f"  - Primeira detecção: índice {primeira_deteccao_por_score[melhor_score]}")
+            
+            # Mostrar resumo por score
+            for score_nome in resultados_var['scores'].keys():
+                n_det = len(resultados_var['deteccoes'][score_nome])
+                max_mart = resultados_var['info_deteccoes'][score_nome]['max_martingale']
+                print(f"  - {score_nome}: {n_det} detecções, max martingale = {max_mart:.2f}")
+        else:
+            print("  - Nenhuma detecção de drift")
+    
+    return resultados_completos
+
+# =============================================================================
+# PARTE 10: EXECUÇÃO
+# =============================================================================
+
+if __name__ == "__main__":
+    # Executar análise
+    resultados = executar_analise_completa()
+    
+    if resultados:
+        print("\n✅ Análise concluída com sucesso!")
+        print("\n💡 Dica: Você pode salvar os resultados ou executar análises adicionais.")
+        print("   Por exemplo, comparar diferentes períodos ou analisar múltiplas agências.")
+        
+        # Opcional: salvar resultados
+        salvar = input("\nDeseja salvar os resultados? (s/n): ")
+        if salvar.lower() == 's':
+            import pickle
+            filename = f"resultados_drift_agencia_{resultados['agencia_id']}.pkl"
+            with open(filename, 'wb') as f:
+                pickle.dump(resultados, f)
+            print(f"✓ Resultados salvos em: {filename}")
