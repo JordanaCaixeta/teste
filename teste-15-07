@@ -1138,6 +1138,12 @@ def main():
     
     # 2. Combinar dados
     df_merged = merge_real_previsto(features_df, previsoes_df)
+
+        # Filtrar agência específica
+    AGENCIA_ANALISE = 20  # Substituir pelo número da agência
+    df_merged = df_merged[df_merged['AGENCIA'] == AGENCIA_ANALISE].copy()
+    print(f"\n Analisando apenas AGÊNCIA {AGENCIA_ANALISE}")
+    print(f"   Total de registros: {len(df_merged)}")
     
     # 3. Executar análise
     resultados = executar_analise_drift(
