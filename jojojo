@@ -1,0 +1,497 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configurações de visualização
+plt.style.use('seaborn-v0_8-darkgrid')
+plt.rcParams['figure.figsize'] = (10, 6)
+plt.rcParams['font.size'] = 12
+
+# =====================================================
+# CARREGAMENTO DOS DADOS
+# =====================================================
+
+# Carregar dados
+features_df = pd.read_parquet('features.parquet')
+previsoes_df = pd.read_csv('previsoes_numerario_pre_pos_pandemia.csv')
+
+# Padronizar nomes de colunas
+previsoes_df = previsoes_df.rename(columns={
+    'DEP_CEI': 'DEPCEI',
+    'DEPOSITO': 'DEP', 
+    'SAQUE': 'SAQ',
+    'SAQUE_CEI': 'SAQCEI'
+})
+
+# Converter datas
+features_df['DATA'] = pd.to_datetime(features_df['DATA'])
+previsoes_df['DATA'] = pd.to_datetime(previsoes_df['DATA'])
+previsoes_df['DATA_PREVISAO'] = pd.to_datetime(previsoes_df['DATA_PREVISAO'])
+previsoes_df['DATA_REFERENCIA'] = pd.to_datetime(previsoes_df['DATA_REFERENCIA'])
+
+# =====================================================
+# PREPARAÇÃO DOS DADOS
+# =====================================================
+
+# Selecionar variáveis alvo
+variaveis_alvo = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+
+# Preparar dados reais
+real_cols = ['AGENCIA', 'DATA'] + variaveis_alvo
+df_real = features_df[real_cols].copy()
+
+# Renomear colunas para diferenciar
+for var in variaveis_alvo:
+    df_real[f'{var}_REAL'] = df_real[var]
+df_real = df_real.drop(columns=variaveis_alvo)
+
+# Preparar dados previstos
+prev_cols = ['AGENCIA', 'DATA', 'DATA_PREVISAO', 'DATA_REFERENCIA'] + variaveis_alvo
+df_prev = previsoes_df[prev_cols].copy()
+
+for var in variaveis_alvo:
+    df_prev[f'{var}_PREV'] = df_prev[var]
+df_prev = df_prev.drop(columns=variaveis_alvo)
+
+# Merge
+df_merged = pd.merge(df_real, df_prev, on=['AGENCIA', 'DATA'], how='inner')
+
+# Filtrar uma agência específica para análise
+AGENCIA_ANALISE = df_merged['AGENCIA'].value_counts().index[0]  # Pega a agência com mais dados
+df_agencia = df_merged[df_merged['AGENCIA'] == AGENCIA_ANALISE].copy()
+df_agencia = df_agencia.sort_values('DATA').reset_index(drop=True)
+
+# =====================================================
+# FUNÇÕES DO MÉTODO CONFORMAL
+# =====================================================
+
+def calcular_pvalores_pred(y_true, y_pred, rtol=1e-3, atol=1e-3):
+    """Calcula p-valores conformais para predição univariada"""
+    alpha = y_true - y_pred
+    N = len(alpha)
+    p_det = np.zeros(N)
+    p_rnd = np.zeros(N)
+    
+    for n in tqdm(range(N), desc="Calculando p-valores"):
+        alpha_n = alpha[n]
+        anteriores = alpha[:n+1]
+        
+        if n == 0:
+            p_det[0] = 1
+            p_rnd[0] = 1
+            continue
+        
+        # Determinístico
+        p_det[n] = np.mean(anteriores >= alpha_n)
+        
+        # Randomizado
+        countG = np.sum(anteriores > alpha_n)
+        countE = np.sum(np.isclose(anteriores, alpha_n, rtol=rtol, atol=atol))
+        u = np.random.uniform() if countE > 0 else 0
+        p_rnd[n] = (countG + u * countE) / (n + 1)
+    
+    return p_det, p_rnd
+
+def calcular_pvalores_multivariado(df_erros, rtol=1e-3, atol=1e-3):
+    """Calcula p-valores conformais para análise multivariada"""
+    df_erros = df_erros.reset_index(drop=True)
+    N = len(df_erros)
+    p_det = np.zeros((2, N))
+    p_rnd = np.zeros((2, N))
+    
+    for n in tqdm(range(N), desc="Calculando p-valores multivariados"):
+        rho = np.zeros((2, n + 1))
+        if n == 0:
+            rho[:, 0] = 0
+        else:
+            for i in range(n + 1):
+                data_i = df_erros.iloc[i].values
+                outros = df_erros.drop(index=i).iloc[:n].values
+                dists = np.linalg.norm(outros - data_i, axis=1)
+                rho[0, i] = np.min(dists) if len(dists) > 0 else 0
+                rho[1, i] = np.mean(dists) if len(dists) > 0 else 0
+        
+        for alpha_idx in [0, 1]:
+            rn = rho[alpha_idx, n]
+            rhos = rho[alpha_idx, :n + 1]
+            p_det[alpha_idx, n] = np.mean(rhos >= rn)
+            
+            ties = np.sum(np.isclose(rhos, rn, rtol=rtol, atol=atol))
+            gt = np.sum(rhos > rn)
+            u = np.random.uniform() if ties > 0 else 0
+            p_rnd[alpha_idx, n] = (gt + u * ties) / (n + 1)
+    
+    return p_det, p_rnd
+
+def power_martingale(p_values, epsilon=0.92):
+    """Calcula Power Martingale"""
+    # Evitar p-valores zero
+    p_values = np.maximum(p_values, 1e-10)
+    # Power martingale
+    betting = epsilon * (p_values ** (epsilon - 1))
+    M = np.cumprod(betting)
+    return M
+
+def simple_jumper_martingale(p_values, J=0.01):
+    """Simple Jumper Martingale"""
+    n = len(p_values)
+    capital = np.zeros(n + 1)
+    capital[0] = 1.0
+    
+    C = {epsilon: 1/3 for epsilon in [-1, 0, 1]}
+    
+    for i in range(n):
+        # Transição
+        C_new = {}
+        total = sum(C.values())
+        for epsilon in [-1, 0, 1]:
+            C_new[epsilon] = (1 - J) * C[epsilon] + J * total / 3
+        
+        # Update com função de aposta
+        p = p_values[i]
+        for epsilon in [-1, 0, 1]:
+            f_eps = 1 + epsilon * (p - 0.5)
+            C_new[epsilon] *= f_eps
+        
+        capital[i + 1] = sum(C_new.values())
+        C = C_new
+    
+    return capital[1:]
+
+# =====================================================
+# ANÁLISE UNIVARIADA - SAQ
+# =====================================================
+
+print("=== ANÁLISE UNIVARIADA - SAQ ===")
+
+y_true_saq = df_agencia['SAQ_REAL'].values
+y_pred_saq = df_agencia['SAQ_PREV'].values
+
+# Calcular p-valores
+p_det_saq, p_rnd_saq = calcular_pvalores_pred(y_true_saq, y_pred_saq)
+
+# Power Martingale
+M_power_saq = power_martingale(p_rnd_saq, epsilon=0.92)
+
+# Simple Jumper
+M_jumper_saq = simple_jumper_martingale(p_rnd_saq)
+
+# Plot
+plt.figure(figsize=(12, 6))
+plt.plot(M_power_saq, label='Power Martingale', color='red', linewidth=2)
+plt.plot(M_jumper_saq, label='Simple Jumper', color='blue', linewidth=2)
+
+# Marcar ponto de mudança aproximado (pandemia)
+change_point = int(len(M_power_saq) * 0.7)  # Aproximadamente onde seria março/2020
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.7, label='Possível Drift')
+
+plt.yscale('log')
+plt.xlabel('Tempo')
+plt.ylabel('Martingale (log)')
+plt.title('Detecção de Drift - SAQ (Saque Caixa Humano)')
+plt.legend()
+plt.grid(True, which="both", ls="--", linewidth=0.5)
+plt.tight_layout()
+plt.show()
+
+# =====================================================
+# ANÁLISE UNIVARIADA - DEP
+# =====================================================
+
+print("\n=== ANÁLISE UNIVARIADA - DEP ===")
+
+y_true_dep = df_agencia['DEP_REAL'].values
+y_pred_dep = df_agencia['DEP_PREV'].values
+
+# Calcular p-valores
+p_det_dep, p_rnd_dep = calcular_pvalores_pred(y_true_dep, y_pred_dep)
+
+# Power Martingale
+M_power_dep = power_martingale(p_rnd_dep, epsilon=0.92)
+
+# Simple Jumper
+M_jumper_dep = simple_jumper_martingale(p_rnd_dep)
+
+# Plot
+plt.figure(figsize=(12, 6))
+plt.plot(M_power_dep, label='Power Martingale', color='green', linewidth=2)
+plt.plot(M_jumper_dep, label='Simple Jumper', color='orange', linewidth=2)
+
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.7, label='Possível Drift')
+
+plt.yscale('log')
+plt.xlabel('Tempo')
+plt.ylabel('Martingale (log)')
+plt.title('Detecção de Drift - DEP (Depósito Caixa Humano)')
+plt.legend()
+plt.grid(True, which="both", ls="--", linewidth=0.5)
+plt.tight_layout()
+plt.show()
+
+# =====================================================
+# ANÁLISE UNIVARIADA - SAQCEI
+# =====================================================
+
+print("\n=== ANÁLISE UNIVARIADA - SAQCEI ===")
+
+y_true_saqcei = df_agencia['SAQCEI_REAL'].values
+y_pred_saqcei = df_agencia['SAQCEI_PREV'].values
+
+# Calcular p-valores
+p_det_saqcei, p_rnd_saqcei = calcular_pvalores_pred(y_true_saqcei, y_pred_saqcei)
+
+# Power Martingale
+M_power_saqcei = power_martingale(p_rnd_saqcei, epsilon=0.92)
+
+# Simple Jumper
+M_jumper_saqcei = simple_jumper_martingale(p_rnd_saqcei)
+
+# Plot
+plt.figure(figsize=(12, 6))
+plt.plot(M_power_saqcei, label='Power Martingale', color='purple', linewidth=2)
+plt.plot(M_jumper_saqcei, label='Simple Jumper', color='brown', linewidth=2)
+
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.7, label='Possível Drift')
+
+plt.yscale('log')
+plt.xlabel('Tempo')
+plt.ylabel('Martingale (log)')
+plt.title('Detecção de Drift - SAQCEI (Saque Caixa Eletrônico)')
+plt.legend()
+plt.grid(True, which="both", ls="--", linewidth=0.5)
+plt.tight_layout()
+plt.show()
+
+# =====================================================
+# ANÁLISE UNIVARIADA - DEPCEI
+# =====================================================
+
+print("\n=== ANÁLISE UNIVARIADA - DEPCEI ===")
+
+y_true_depcei = df_agencia['DEPCEI_REAL'].values
+y_pred_depcei = df_agencia['DEPCEI_PREV'].values
+
+# Calcular p-valores
+p_det_depcei, p_rnd_depcei = calcular_pvalores_pred(y_true_depcei, y_pred_depcei)
+
+# Power Martingale
+M_power_depcei = power_martingale(p_rnd_depcei, epsilon=0.92)
+
+# Simple Jumper
+M_jumper_depcei = simple_jumper_martingale(p_rnd_depcei)
+
+# Plot
+plt.figure(figsize=(12, 6))
+plt.plot(M_power_depcei, label='Power Martingale', color='darkblue', linewidth=2)
+plt.plot(M_jumper_depcei, label='Simple Jumper', color='darkgreen', linewidth=2)
+
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.7, label='Possível Drift')
+
+plt.yscale('log')
+plt.xlabel('Tempo')
+plt.ylabel('Martingale (log)')
+plt.title('Detecção de Drift - DEPCEI (Depósito Caixa Eletrônico)')
+plt.legend()
+plt.grid(True, which="both", ls="--", linewidth=0.5)
+plt.tight_layout()
+plt.show()
+
+# =====================================================
+# ANÁLISE MULTIVARIADA
+# =====================================================
+
+print("\n=== ANÁLISE MULTIVARIADA ===")
+
+# Criar DataFrame com erros de todas as variáveis
+df_erros = pd.DataFrame({
+    'SAQ': y_true_saq - y_pred_saq,
+    'DEP': y_true_dep - y_pred_dep,
+    'SAQCEI': y_true_saqcei - y_pred_saqcei,
+    'DEPCEI': y_true_depcei - y_pred_depcei
+})
+
+# Calcular p-valores multivariados
+p_det_multi, p_rnd_multi = calcular_pvalores_multivariado(df_erros)
+
+# Power Martingale para alpha=0 (distância mínima)
+M_power_multi_alpha0 = power_martingale(p_rnd_multi[0], epsilon=0.92)
+
+# Power Martingale para alpha=1 (distância média)
+M_power_multi_alpha1 = power_martingale(p_rnd_multi[1], epsilon=0.92)
+
+# Simple Jumper para alpha=0
+M_jumper_multi_alpha0 = simple_jumper_martingale(p_rnd_multi[0])
+
+# Simple Jumper para alpha=1
+M_jumper_multi_alpha1 = simple_jumper_martingale(p_rnd_multi[1])
+
+# Plot
+plt.figure(figsize=(14, 8))
+
+plt.plot(M_power_multi_alpha0, label='Power (α=0, dist. mín)', color='red', linewidth=2)
+plt.plot(M_power_multi_alpha1, label='Power (α=1, dist. média)', color='blue', linewidth=2)
+plt.plot(M_jumper_multi_alpha0, label='Jumper (α=0, dist. mín)', color='orange', linewidth=2, linestyle='--')
+plt.plot(M_jumper_multi_alpha1, label='Jumper (α=1, dist. média)', color='green', linewidth=2, linestyle='--')
+
+plt.axvline(change_point, color='black', linestyle=':', alpha=0.7, label='Possível Drift')
+
+plt.yscale('log')
+plt.xlabel('Tempo')
+plt.ylabel('Martingale (log)')
+plt.title('Detecção de Drift Multivariada - Todas as Variáveis')
+plt.legend()
+plt.grid(True, which="both", ls="--", linewidth=0.5)
+plt.tight_layout()
+plt.show()
+
+# =====================================================
+# COMPARAÇÃO GERAL - TODOS OS MARTINGALES
+# =====================================================
+
+print("\n=== COMPARAÇÃO GERAL ===")
+
+plt.figure(figsize=(16, 10))
+
+# Subplot 1: Power Martingales Univariados
+plt.subplot(2, 2, 1)
+plt.plot(M_power_saq, label='SAQ', linewidth=2)
+plt.plot(M_power_dep, label='DEP', linewidth=2)
+plt.plot(M_power_saqcei, label='SAQCEI', linewidth=2)
+plt.plot(M_power_depcei, label='DEPCEI', linewidth=2)
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.5)
+plt.yscale('log')
+plt.xlabel('Tempo')
+plt.ylabel('Power Martingale (log)')
+plt.title('Power Martingales - Análise Univariada')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# Subplot 2: Simple Jumper Univariados
+plt.subplot(2, 2, 2)
+plt.plot(M_jumper_saq, label='SAQ', linewidth=2)
+plt.plot(M_jumper_dep, label='DEP', linewidth=2)
+plt.plot(M_jumper_saqcei, label='SAQCEI', linewidth=2)
+plt.plot(M_jumper_depcei, label='DEPCEI', linewidth=2)
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.5)
+plt.yscale('log')
+plt.xlabel('Tempo')
+plt.ylabel('Simple Jumper (log)')
+plt.title('Simple Jumper Martingales - Análise Univariada')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# Subplot 3: Multivariado vs Melhor Univariado (Power)
+plt.subplot(2, 2, 3)
+max_univariado_power = np.maximum.reduce([M_power_saq, M_power_dep, M_power_saqcei, M_power_depcei])
+plt.plot(max_univariado_power, label='Max Univariado', linewidth=2, color='darkred')
+plt.plot(M_power_multi_alpha0, label='Multivariado (α=0)', linewidth=2, color='darkblue')
+plt.plot(M_power_multi_alpha1, label='Multivariado (α=1)', linewidth=2, color='darkgreen')
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.5)
+plt.yscale('log')
+plt.xlabel('Tempo')
+plt.ylabel('Power Martingale (log)')
+plt.title('Comparação: Univariado vs Multivariado')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+# Subplot 4: Evolução dos Erros
+plt.subplot(2, 2, 4)
+erro_relativo_saq = np.abs(y_true_saq - y_pred_saq) / (np.abs(y_true_saq) + 1e-8)
+erro_relativo_dep = np.abs(y_true_dep - y_pred_dep) / (np.abs(y_true_dep) + 1e-8)
+erro_relativo_saqcei = np.abs(y_true_saqcei - y_pred_saqcei) / (np.abs(y_true_saqcei) + 1e-8)
+erro_relativo_depcei = np.abs(y_true_depcei - y_pred_depcei) / (np.abs(y_true_depcei) + 1e-8)
+
+# Média móvel dos erros (janela de 30 dias)
+window = 30
+erro_ma_saq = pd.Series(erro_relativo_saq).rolling(window).mean()
+erro_ma_dep = pd.Series(erro_relativo_dep).rolling(window).mean()
+erro_ma_saqcei = pd.Series(erro_relativo_saqcei).rolling(window).mean()
+erro_ma_depcei = pd.Series(erro_relativo_depcei).rolling(window).mean()
+
+plt.plot(erro_ma_saq, label='SAQ', alpha=0.8)
+plt.plot(erro_ma_dep, label='DEP', alpha=0.8)
+plt.plot(erro_ma_saqcei, label='SAQCEI', alpha=0.8)
+plt.plot(erro_ma_depcei, label='DEPCEI', alpha=0.8)
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.5)
+plt.xlabel('Tempo')
+plt.ylabel('Erro Relativo (Média Móvel 30d)')
+plt.title('Evolução dos Erros Relativos')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# =====================================================
+# DETECÇÃO DE PONTOS DE MUDANÇA
+# =====================================================
+
+def detectar_mudanca(martingale, threshold=20, min_consecutivos=3):
+    """Detecta pontos de mudança quando martingale > threshold"""
+    deteccoes = []
+    consecutivos = 0
+    
+    for i in range(len(martingale)):
+        if martingale[i] > threshold:
+            consecutivos += 1
+            if consecutivos >= min_consecutivos:
+                if len(deteccoes) == 0 or i - deteccoes[-1] > 30:
+                    deteccoes.append(i)
+        else:
+            consecutivos = 0
+    
+    return deteccoes
+
+# Detectar mudanças
+print("\n=== DETECÇÃO DE MUDANÇAS ===")
+
+# Univariadas
+det_saq = detectar_mudanca(M_power_saq)
+det_dep = detectar_mudanca(M_power_dep)
+det_saqcei = detectar_mudanca(M_power_saqcei)
+det_depcei = detectar_mudanca(M_power_depcei)
+
+# Multivariada
+det_multi_0 = detectar_mudanca(M_power_multi_alpha0)
+det_multi_1 = detectar_mudanca(M_power_multi_alpha1)
+
+# Visualizar detecções
+plt.figure(figsize=(14, 8))
+
+# Criar timeline
+tempo = np.arange(len(df_agencia))
+plt.scatter(tempo, np.zeros_like(tempo), alpha=0.1, s=1, c='gray')
+
+# Marcar detecções univariadas
+if det_saq: plt.scatter(det_saq, [1]*len(det_saq), label='SAQ', s=100, alpha=0.7)
+if det_dep: plt.scatter(det_dep, [2]*len(det_dep), label='DEP', s=100, alpha=0.7)
+if det_saqcei: plt.scatter(det_saqcei, [3]*len(det_saqcei), label='SAQCEI', s=100, alpha=0.7)
+if det_depcei: plt.scatter(det_depcei, [4]*len(det_depcei), label='DEPCEI', s=100, alpha=0.7)
+
+# Marcar detecções multivariadas
+if det_multi_0: plt.scatter(det_multi_0, [5]*len(det_multi_0), label='Multi α=0', s=150, marker='^')
+if det_multi_1: plt.scatter(det_multi_1, [6]*len(det_multi_1), label='Multi α=1', s=150, marker='^')
+
+plt.axvline(change_point, color='black', linestyle='--', alpha=0.5, label='Possível Drift')
+
+plt.ylim(-0.5, 6.5)
+plt.xlabel('Tempo')
+plt.yticks(range(7), ['', 'SAQ', 'DEP', 'SAQCEI', 'DEPCEI', 'Multi α=0', 'Multi α=1'])
+plt.title('Timeline de Detecções de Drift')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True, axis='x', alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Resumo
+print(f"\nDetecções encontradas:")
+print(f"SAQ: {len(det_saq)} detecções")
+print(f"DEP: {len(det_dep)} detecções")
+print(f"SAQCEI: {len(det_saqcei)} detecções")
+print(f"DEPCEI: {len(det_depcei)} detecções")
+print(f"Multivariada (α=0): {len(det_multi_0)} detecções")
+print(f"Multivariada (α=1): {len(det_multi_1)} detecções")
