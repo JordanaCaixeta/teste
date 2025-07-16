@@ -1,497 +1,673 @@
-import pandas as pd
+#!/usr/bin/env python3
+"""
+Conformal Prediction for Drift Detection in Numerários Model Predictions
+
+This script implements conformal prediction methods to detect drift in model predictions
+by comparing predicted values with actual values over time. It uses p-values and 
+martingales to identify when the model's predictions become unreliable.
+
+Theory: Conformal prediction provides distribution-free uncertainty quantification
+under the exchangeability assumption. When this assumption is violated (drift occurs),
+p-values are no longer uniformly distributed, which can be detected using martingales.
+"""
+
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+import seaborn as sns
 from datetime import datetime
+from typing import Tuple, List, Dict, Optional, Union
 import warnings
 warnings.filterwarnings('ignore')
 
-# Configurações de visualização
-plt.style.use('seaborn-v0_8-darkgrid')
-plt.rcParams['figure.figsize'] = (10, 6)
-plt.rcParams['font.size'] = 12
+# Set random seed for reproducibility
+np.random.seed(42)
 
-# =====================================================
-# CARREGAMENTO DOS DADOS
-# =====================================================
+# =============================================================================
+# 1. DATA LOADING AND PREPROCESSING
+# =============================================================================
 
-# Carregar dados
-features_df = pd.read_parquet('features.parquet')
-previsoes_df = pd.read_csv('previsoes_numerario_pre_pos_pandemia.csv')
-
-# Padronizar nomes de colunas
-previsoes_df = previsoes_df.rename(columns={
-    'DEP_CEI': 'DEPCEI',
-    'DEPOSITO': 'DEP', 
-    'SAQUE': 'SAQ',
-    'SAQUE_CEI': 'SAQCEI'
-})
-
-# Converter datas
-features_df['DATA'] = pd.to_datetime(features_df['DATA'])
-previsoes_df['DATA'] = pd.to_datetime(previsoes_df['DATA'])
-previsoes_df['DATA_PREVISAO'] = pd.to_datetime(previsoes_df['DATA_PREVISAO'])
-previsoes_df['DATA_REFERENCIA'] = pd.to_datetime(previsoes_df['DATA_REFERENCIA'])
-
-# =====================================================
-# PREPARAÇÃO DOS DADOS
-# =====================================================
-
-# Selecionar variáveis alvo
-variaveis_alvo = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
-
-# Preparar dados reais
-real_cols = ['AGENCIA', 'DATA'] + variaveis_alvo
-df_real = features_df[real_cols].copy()
-
-# Renomear colunas para diferenciar
-for var in variaveis_alvo:
-    df_real[f'{var}_REAL'] = df_real[var]
-df_real = df_real.drop(columns=variaveis_alvo)
-
-# Preparar dados previstos
-prev_cols = ['AGENCIA', 'DATA', 'DATA_PREVISAO', 'DATA_REFERENCIA'] + variaveis_alvo
-df_prev = previsoes_df[prev_cols].copy()
-
-for var in variaveis_alvo:
-    df_prev[f'{var}_PREV'] = df_prev[var]
-df_prev = df_prev.drop(columns=variaveis_alvo)
-
-# Merge
-df_merged = pd.merge(df_real, df_prev, on=['AGENCIA', 'DATA'], how='inner')
-
-# Filtrar uma agência específica para análise
-AGENCIA_ANALISE = df_merged['AGENCIA'].value_counts().index[0]  # Pega a agência com mais dados
-df_agencia = df_merged[df_merged['AGENCIA'] == AGENCIA_ANALISE].copy()
-df_agencia = df_agencia.sort_values('DATA').reset_index(drop=True)
-
-# =====================================================
-# FUNÇÕES DO MÉTODO CONFORMAL
-# =====================================================
-
-def calcular_pvalores_pred(y_true, y_pred, rtol=1e-3, atol=1e-3):
-    """Calcula p-valores conformais para predição univariada"""
-    alpha = y_true - y_pred
-    N = len(alpha)
-    p_det = np.zeros(N)
-    p_rnd = np.zeros(N)
+def load_and_merge_data(predictions_path: str, features_path: str) -> pd.DataFrame:
+    """
+    Load predictions and real values data, then merge them.
     
-    for n in tqdm(range(N), desc="Calculando p-valores"):
-        alpha_n = alpha[n]
-        anteriores = alpha[:n+1]
-        
-        if n == 0:
-            p_det[0] = 1
-            p_rnd[0] = 1
-            continue
-        
-        # Determinístico
-        p_det[n] = np.mean(anteriores >= alpha_n)
-        
-        # Randomizado
-        countG = np.sum(anteriores > alpha_n)
-        countE = np.sum(np.isclose(anteriores, alpha_n, rtol=rtol, atol=atol))
-        u = np.random.uniform() if countE > 0 else 0
-        p_rnd[n] = (countG + u * countE) / (n + 1)
+    Args:
+        predictions_path: Path to CSV file with predictions
+        features_path: Path to parquet file with real values
     
-    return p_det, p_rnd
+    Returns:
+        Merged DataFrame with predictions and real values
+    """
+    print("Loading data files...")
+    
+    # Load predictions from CSV
+    predictions_df = pd.read_csv(predictions_path)
+    print(f"Loaded predictions: {predictions_df.shape}")
+    
+    # Load features/real values from parquet
+    features_df = pd.read_parquet(features_path)
+    print(f"Loaded features: {features_df.shape}")
+    
+    # Convert DATA column to datetime in both dataframes
+    predictions_df['DATA'] = pd.to_datetime(predictions_df['DATA'])
+    features_df['DATA'] = pd.to_datetime(features_df['DATA'])
+    
+    # Merge on AGENCIA and DATA
+    merged_df = pd.merge(
+        predictions_df,
+        features_df,
+        on=['AGENCIA', 'DATA'],
+        how='inner',
+        suffixes=('_pred', '_real')
+    )
+    
+    print(f"Merged data shape: {merged_df.shape}")
+    print(f"Agencies in data: {merged_df['AGENCIA'].nunique()}")
+    
+    return merged_df
 
-def calcular_pvalores_multivariado(df_erros, rtol=1e-3, atol=1e-3):
-    """Calcula p-valores conformais para análise multivariada"""
-    df_erros = df_erros.reset_index(drop=True)
-    N = len(df_erros)
-    p_det = np.zeros((2, N))
-    p_rnd = np.zeros((2, N))
+# =============================================================================
+# 2. NONCONFORMITY SCORE FUNCTIONS
+# =============================================================================
+
+def absolute_residual_score(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    """
+    Calculate absolute residual nonconformity scores.
     
-    for n in tqdm(range(N), desc="Calculando p-valores multivariados"):
-        rho = np.zeros((2, n + 1))
-        if n == 0:
-            rho[:, 0] = 0
+    Theory: The nonconformity score measures how different a prediction is from
+    the true value. Under exchangeability, these scores should be exchangeable.
+    
+    Args:
+        y_true: True values
+        y_pred: Predicted values
+    
+    Returns:
+        Array of nonconformity scores
+    """
+    return np.abs(y_true - y_pred)
+
+def normalized_residual_score(y_true: np.ndarray, y_pred: np.ndarray, 
+                            epsilon: float = 1e-8) -> np.ndarray:
+    """
+    Calculate normalized residual nonconformity scores.
+    
+    Theory: Normalization can help handle heteroscedasticity by scaling residuals
+    relative to the prediction magnitude.
+    
+    Args:
+        y_true: True values
+        y_pred: Predicted values
+        epsilon: Small constant to avoid division by zero
+    
+    Returns:
+        Array of normalized nonconformity scores
+    """
+    return np.abs(y_true - y_pred) / (np.abs(y_pred) + epsilon)
+
+def signed_residual_score(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    """
+    Calculate signed residual nonconformity scores.
+    
+    Theory: Signed residuals can detect directional drift (systematic over/under-prediction).
+    
+    Args:
+        y_true: True values
+        y_pred: Predicted values
+    
+    Returns:
+        Array of signed nonconformity scores
+    """
+    return y_true - y_pred
+
+# =============================================================================
+# 3. P-VALUE COMPUTATION
+# =============================================================================
+
+def compute_conformal_pvalue(calibration_scores: np.ndarray, 
+                           test_score: float,
+                           tie_breaking: str = 'random') -> float:
+    """
+    Compute conformal p-value for a test observation.
+    
+    Theory: The p-value represents the proportion of calibration scores that are
+    at least as extreme as the test score. Under exchangeability, p-values are
+    uniformly distributed on [0,1].
+    
+    Args:
+        calibration_scores: Array of calibration nonconformity scores
+        test_score: Nonconformity score for test observation
+        tie_breaking: Method for handling ties ('random' or 'conservative')
+    
+    Returns:
+        Conformal p-value
+    """
+    n = len(calibration_scores)
+    
+    if tie_breaking == 'random':
+        # Random tie-breaking for exact validity
+        theta = np.random.uniform(0, 1)
+        rank = np.sum(calibration_scores < test_score) + \
+               theta * np.sum(calibration_scores == test_score)
+    else:
+        # Conservative approach
+        rank = np.sum(calibration_scores <= test_score)
+    
+    # Add 1 to include the test observation itself
+    p_value = (rank + 1) / (n + 1)
+    
+    return p_value
+
+def compute_pvalues_batch(calibration_scores: np.ndarray,
+                         test_scores: np.ndarray) -> np.ndarray:
+    """
+    Compute p-values for multiple test observations efficiently.
+    
+    Args:
+        calibration_scores: Array of calibration nonconformity scores
+        test_scores: Array of test nonconformity scores
+    
+    Returns:
+        Array of p-values
+    """
+    p_values = []
+    for score in test_scores:
+        p_value = compute_conformal_pvalue(calibration_scores, score)
+        p_values.append(p_value)
+    
+    return np.array(p_values)
+
+# =============================================================================
+# 4. MARTINGALE FUNCTIONS
+# =============================================================================
+
+class SimpleMartingale:
+    """
+    Simple betting martingale for drift detection.
+    
+    Theory: Martingales transform p-values into a process that grows exponentially
+    when drift occurs while remaining bounded under the null hypothesis.
+    """
+    
+    def __init__(self):
+        self.value = 1.0
+        self.history = [1.0]
+    
+    def update(self, p_value: float) -> float:
+        """Update martingale with new p-value using simple betting function."""
+        # Simple betting function: bet more on small p-values
+        bet = 1.5 if p_value < 0.5 else 0.5
+        self.value *= bet
+        self.history.append(self.value)
+        return self.value
+    
+    def reset(self):
+        """Reset martingale to initial state."""
+        self.value = 1.0
+        self.history = [1.0]
+
+class MixtureMartingale:
+    """
+    Mixture martingale using logarithmic betting function.
+    
+    Theory: The mixture martingale integrates over all possible betting strategies,
+    providing good power against various types of drift.
+    """
+    
+    def __init__(self):
+        self.value = 1.0
+        self.history = [1.0]
+    
+    def update(self, p_value: float) -> float:
+        """Update martingale with new p-value using mixture betting function."""
+        # Mixture betting function approximation
+        if p_value > 1e-10:
+            bet = -1 / np.log(p_value)
         else:
-            for i in range(n + 1):
-                data_i = df_erros.iloc[i].values
-                outros = df_erros.drop(index=i).iloc[:n].values
-                dists = np.linalg.norm(outros - data_i, axis=1)
-                rho[0, i] = np.min(dists) if len(dists) > 0 else 0
-                rho[1, i] = np.mean(dists) if len(dists) > 0 else 0
+            bet = 1e10  # Cap for numerical stability
         
-        for alpha_idx in [0, 1]:
-            rn = rho[alpha_idx, n]
-            rhos = rho[alpha_idx, :n + 1]
-            p_det[alpha_idx, n] = np.mean(rhos >= rn)
+        self.value *= bet
+        self.history.append(self.value)
+        return self.value
+    
+    def reset(self):
+        """Reset martingale to initial state."""
+        self.value = 1.0
+        self.history = [1.0]
+
+class PowerMartingale:
+    """
+    Power martingale with configurable parameter.
+    
+    Theory: Power martingales use the betting function g(p) = ε·p^(ε-1),
+    where ε controls the sensitivity to different p-value ranges.
+    """
+    
+    def __init__(self, epsilon: float = 0.5):
+        self.epsilon = epsilon
+        self.value = 1.0
+        self.history = [1.0]
+    
+    def update(self, p_value: float) -> float:
+        """Update martingale with new p-value using power betting function."""
+        if p_value > 1e-10:
+            bet = self.epsilon * (p_value ** (self.epsilon - 1))
+        else:
+            bet = 1e10  # Cap for numerical stability
             
-            ties = np.sum(np.isclose(rhos, rn, rtol=rtol, atol=atol))
-            gt = np.sum(rhos > rn)
-            u = np.random.uniform() if ties > 0 else 0
-            p_rnd[alpha_idx, n] = (gt + u * ties) / (n + 1)
+        self.value *= bet
+        self.history.append(self.value)
+        return self.value
     
-    return p_det, p_rnd
+    def reset(self):
+        """Reset martingale to initial state."""
+        self.value = 1.0
+        self.history = [1.0]
 
-def power_martingale(p_values, epsilon=0.92):
-    """Calcula Power Martingale"""
-    # Evitar p-valores zero
-    p_values = np.maximum(p_values, 1e-10)
-    # Power martingale
-    betting = epsilon * (p_values ** (epsilon - 1))
-    M = np.cumprod(betting)
-    return M
+# =============================================================================
+# 5. DRIFT DETECTION PROCEDURES
+# =============================================================================
 
-def simple_jumper_martingale(p_values, J=0.01):
-    """Simple Jumper Martingale"""
-    n = len(p_values)
-    capital = np.zeros(n + 1)
-    capital[0] = 1.0
+def ville_procedure(martingale_values: List[float], threshold: float = 100) -> Optional[int]:
+    """
+    Ville's inequality-based drift detection.
     
-    C = {epsilon: 1/3 for epsilon in [-1, 0, 1]}
+    Theory: By Ville's inequality, P(max(S_n) >= C) <= 1/C for any martingale S_n. 
+    This provides false alarm control at level 1/threshold.
     
-    for i in range(n):
-        # Transição
-        C_new = {}
-        total = sum(C.values())
-        for epsilon in [-1, 0, 1]:
-            C_new[epsilon] = (1 - J) * C[epsilon] + J * total / 3
+    Args:
+        martingale_values: List of martingale values
+        threshold: Detection threshold
+    
+    Returns:
+        Index of first drift detection or None
+    """
+    for i, value in enumerate(martingale_values):
+        if value >= threshold:
+            return i
+    return None
+
+def cusum_procedure(martingale_values: List[float], threshold: float = 20) -> Optional[int]:
+    """
+    CUSUM-based change detection using martingale ratios.
+    
+    Theory: CUSUM detects persistent changes by accumulating evidence over time.
+    
+    Args:
+        martingale_values: List of martingale values
+        threshold: Detection threshold for CUSUM statistic
+    
+    Returns:
+        Index of first drift detection or None
+    """
+    for i in range(1, len(martingale_values)):
+        # Compute maximum ratio S_n / S_j for all j <= n
+        max_ratio = max(martingale_values[i] / martingale_values[j] 
+                       for j in range(i + 1))
+        if max_ratio >= threshold:
+            return i
+    return None
+
+# =============================================================================
+# 6. CONFORMAL DRIFT DETECTOR CLASS
+# =============================================================================
+
+class ConformalDriftDetector:
+    """
+    Main class for conformal prediction-based drift detection.
+    
+    This class implements the complete workflow for detecting drift in predictions
+    using conformal prediction, p-values, and martingales.
+    """
+    
+    def __init__(self, 
+                 nonconformity_measure: str = 'absolute_residual',
+                 martingale_type: str = 'simple',
+                 detection_threshold: float = 100,
+                 calibration_window: int = 500):
+        """
+        Initialize drift detector.
         
-        # Update com função de aposta
-        p = p_values[i]
-        for epsilon in [-1, 0, 1]:
-            f_eps = 1 + epsilon * (p - 0.5)
-            C_new[epsilon] *= f_eps
+        Args:
+            nonconformity_measure: Type of nonconformity score to use
+            martingale_type: Type of martingale ('simple', 'mixture', 'power')
+            detection_threshold: Threshold for drift detection
+            calibration_window: Size of calibration window
+        """
+        self.nonconformity_measure = nonconformity_measure
+        self.detection_threshold = detection_threshold
+        self.calibration_window = calibration_window
         
-        capital[i + 1] = sum(C_new.values())
-        C = C_new
-    
-    return capital[1:]
-
-# =====================================================
-# ANÁLISE UNIVARIADA - SAQ
-# =====================================================
-
-print("=== ANÁLISE UNIVARIADA - SAQ ===")
-
-y_true_saq = df_agencia['SAQ_REAL'].values
-y_pred_saq = df_agencia['SAQ_PREV'].values
-
-# Calcular p-valores
-p_det_saq, p_rnd_saq = calcular_pvalores_pred(y_true_saq, y_pred_saq)
-
-# Power Martingale
-M_power_saq = power_martingale(p_rnd_saq, epsilon=0.92)
-
-# Simple Jumper
-M_jumper_saq = simple_jumper_martingale(p_rnd_saq)
-
-# Plot
-plt.figure(figsize=(12, 6))
-plt.plot(M_power_saq, label='Power Martingale', color='red', linewidth=2)
-plt.plot(M_jumper_saq, label='Simple Jumper', color='blue', linewidth=2)
-
-# Marcar ponto de mudança aproximado (pandemia)
-change_point = int(len(M_power_saq) * 0.7)  # Aproximadamente onde seria março/2020
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.7, label='Possível Drift')
-
-plt.yscale('log')
-plt.xlabel('Tempo')
-plt.ylabel('Martingale (log)')
-plt.title('Detecção de Drift - SAQ (Saque Caixa Humano)')
-plt.legend()
-plt.grid(True, which="both", ls="--", linewidth=0.5)
-plt.tight_layout()
-plt.show()
-
-# =====================================================
-# ANÁLISE UNIVARIADA - DEP
-# =====================================================
-
-print("\n=== ANÁLISE UNIVARIADA - DEP ===")
-
-y_true_dep = df_agencia['DEP_REAL'].values
-y_pred_dep = df_agencia['DEP_PREV'].values
-
-# Calcular p-valores
-p_det_dep, p_rnd_dep = calcular_pvalores_pred(y_true_dep, y_pred_dep)
-
-# Power Martingale
-M_power_dep = power_martingale(p_rnd_dep, epsilon=0.92)
-
-# Simple Jumper
-M_jumper_dep = simple_jumper_martingale(p_rnd_dep)
-
-# Plot
-plt.figure(figsize=(12, 6))
-plt.plot(M_power_dep, label='Power Martingale', color='green', linewidth=2)
-plt.plot(M_jumper_dep, label='Simple Jumper', color='orange', linewidth=2)
-
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.7, label='Possível Drift')
-
-plt.yscale('log')
-plt.xlabel('Tempo')
-plt.ylabel('Martingale (log)')
-plt.title('Detecção de Drift - DEP (Depósito Caixa Humano)')
-plt.legend()
-plt.grid(True, which="both", ls="--", linewidth=0.5)
-plt.tight_layout()
-plt.show()
-
-# =====================================================
-# ANÁLISE UNIVARIADA - SAQCEI
-# =====================================================
-
-print("\n=== ANÁLISE UNIVARIADA - SAQCEI ===")
-
-y_true_saqcei = df_agencia['SAQCEI_REAL'].values
-y_pred_saqcei = df_agencia['SAQCEI_PREV'].values
-
-# Calcular p-valores
-p_det_saqcei, p_rnd_saqcei = calcular_pvalores_pred(y_true_saqcei, y_pred_saqcei)
-
-# Power Martingale
-M_power_saqcei = power_martingale(p_rnd_saqcei, epsilon=0.92)
-
-# Simple Jumper
-M_jumper_saqcei = simple_jumper_martingale(p_rnd_saqcei)
-
-# Plot
-plt.figure(figsize=(12, 6))
-plt.plot(M_power_saqcei, label='Power Martingale', color='purple', linewidth=2)
-plt.plot(M_jumper_saqcei, label='Simple Jumper', color='brown', linewidth=2)
-
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.7, label='Possível Drift')
-
-plt.yscale('log')
-plt.xlabel('Tempo')
-plt.ylabel('Martingale (log)')
-plt.title('Detecção de Drift - SAQCEI (Saque Caixa Eletrônico)')
-plt.legend()
-plt.grid(True, which="both", ls="--", linewidth=0.5)
-plt.tight_layout()
-plt.show()
-
-# =====================================================
-# ANÁLISE UNIVARIADA - DEPCEI
-# =====================================================
-
-print("\n=== ANÁLISE UNIVARIADA - DEPCEI ===")
-
-y_true_depcei = df_agencia['DEPCEI_REAL'].values
-y_pred_depcei = df_agencia['DEPCEI_PREV'].values
-
-# Calcular p-valores
-p_det_depcei, p_rnd_depcei = calcular_pvalores_pred(y_true_depcei, y_pred_depcei)
-
-# Power Martingale
-M_power_depcei = power_martingale(p_rnd_depcei, epsilon=0.92)
-
-# Simple Jumper
-M_jumper_depcei = simple_jumper_martingale(p_rnd_depcei)
-
-# Plot
-plt.figure(figsize=(12, 6))
-plt.plot(M_power_depcei, label='Power Martingale', color='darkblue', linewidth=2)
-plt.plot(M_jumper_depcei, label='Simple Jumper', color='darkgreen', linewidth=2)
-
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.7, label='Possível Drift')
-
-plt.yscale('log')
-plt.xlabel('Tempo')
-plt.ylabel('Martingale (log)')
-plt.title('Detecção de Drift - DEPCEI (Depósito Caixa Eletrônico)')
-plt.legend()
-plt.grid(True, which="both", ls="--", linewidth=0.5)
-plt.tight_layout()
-plt.show()
-
-# =====================================================
-# ANÁLISE MULTIVARIADA
-# =====================================================
-
-print("\n=== ANÁLISE MULTIVARIADA ===")
-
-# Criar DataFrame com erros de todas as variáveis
-df_erros = pd.DataFrame({
-    'SAQ': y_true_saq - y_pred_saq,
-    'DEP': y_true_dep - y_pred_dep,
-    'SAQCEI': y_true_saqcei - y_pred_saqcei,
-    'DEPCEI': y_true_depcei - y_pred_depcei
-})
-
-# Calcular p-valores multivariados
-p_det_multi, p_rnd_multi = calcular_pvalores_multivariado(df_erros)
-
-# Power Martingale para alpha=0 (distância mínima)
-M_power_multi_alpha0 = power_martingale(p_rnd_multi[0], epsilon=0.92)
-
-# Power Martingale para alpha=1 (distância média)
-M_power_multi_alpha1 = power_martingale(p_rnd_multi[1], epsilon=0.92)
-
-# Simple Jumper para alpha=0
-M_jumper_multi_alpha0 = simple_jumper_martingale(p_rnd_multi[0])
-
-# Simple Jumper para alpha=1
-M_jumper_multi_alpha1 = simple_jumper_martingale(p_rnd_multi[1])
-
-# Plot
-plt.figure(figsize=(14, 8))
-
-plt.plot(M_power_multi_alpha0, label='Power (α=0, dist. mín)', color='red', linewidth=2)
-plt.plot(M_power_multi_alpha1, label='Power (α=1, dist. média)', color='blue', linewidth=2)
-plt.plot(M_jumper_multi_alpha0, label='Jumper (α=0, dist. mín)', color='orange', linewidth=2, linestyle='--')
-plt.plot(M_jumper_multi_alpha1, label='Jumper (α=1, dist. média)', color='green', linewidth=2, linestyle='--')
-
-plt.axvline(change_point, color='black', linestyle=':', alpha=0.7, label='Possível Drift')
-
-plt.yscale('log')
-plt.xlabel('Tempo')
-plt.ylabel('Martingale (log)')
-plt.title('Detecção de Drift Multivariada - Todas as Variáveis')
-plt.legend()
-plt.grid(True, which="both", ls="--", linewidth=0.5)
-plt.tight_layout()
-plt.show()
-
-# =====================================================
-# COMPARAÇÃO GERAL - TODOS OS MARTINGALES
-# =====================================================
-
-print("\n=== COMPARAÇÃO GERAL ===")
-
-plt.figure(figsize=(16, 10))
-
-# Subplot 1: Power Martingales Univariados
-plt.subplot(2, 2, 1)
-plt.plot(M_power_saq, label='SAQ', linewidth=2)
-plt.plot(M_power_dep, label='DEP', linewidth=2)
-plt.plot(M_power_saqcei, label='SAQCEI', linewidth=2)
-plt.plot(M_power_depcei, label='DEPCEI', linewidth=2)
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.5)
-plt.yscale('log')
-plt.xlabel('Tempo')
-plt.ylabel('Power Martingale (log)')
-plt.title('Power Martingales - Análise Univariada')
-plt.legend()
-plt.grid(True, alpha=0.3)
-
-# Subplot 2: Simple Jumper Univariados
-plt.subplot(2, 2, 2)
-plt.plot(M_jumper_saq, label='SAQ', linewidth=2)
-plt.plot(M_jumper_dep, label='DEP', linewidth=2)
-plt.plot(M_jumper_saqcei, label='SAQCEI', linewidth=2)
-plt.plot(M_jumper_depcei, label='DEPCEI', linewidth=2)
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.5)
-plt.yscale('log')
-plt.xlabel('Tempo')
-plt.ylabel('Simple Jumper (log)')
-plt.title('Simple Jumper Martingales - Análise Univariada')
-plt.legend()
-plt.grid(True, alpha=0.3)
-
-# Subplot 3: Multivariado vs Melhor Univariado (Power)
-plt.subplot(2, 2, 3)
-max_univariado_power = np.maximum.reduce([M_power_saq, M_power_dep, M_power_saqcei, M_power_depcei])
-plt.plot(max_univariado_power, label='Max Univariado', linewidth=2, color='darkred')
-plt.plot(M_power_multi_alpha0, label='Multivariado (α=0)', linewidth=2, color='darkblue')
-plt.plot(M_power_multi_alpha1, label='Multivariado (α=1)', linewidth=2, color='darkgreen')
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.5)
-plt.yscale('log')
-plt.xlabel('Tempo')
-plt.ylabel('Power Martingale (log)')
-plt.title('Comparação: Univariado vs Multivariado')
-plt.legend()
-plt.grid(True, alpha=0.3)
-
-# Subplot 4: Evolução dos Erros
-plt.subplot(2, 2, 4)
-erro_relativo_saq = np.abs(y_true_saq - y_pred_saq) / (np.abs(y_true_saq) + 1e-8)
-erro_relativo_dep = np.abs(y_true_dep - y_pred_dep) / (np.abs(y_true_dep) + 1e-8)
-erro_relativo_saqcei = np.abs(y_true_saqcei - y_pred_saqcei) / (np.abs(y_true_saqcei) + 1e-8)
-erro_relativo_depcei = np.abs(y_true_depcei - y_pred_depcei) / (np.abs(y_true_depcei) + 1e-8)
-
-# Média móvel dos erros (janela de 30 dias)
-window = 30
-erro_ma_saq = pd.Series(erro_relativo_saq).rolling(window).mean()
-erro_ma_dep = pd.Series(erro_relativo_dep).rolling(window).mean()
-erro_ma_saqcei = pd.Series(erro_relativo_saqcei).rolling(window).mean()
-erro_ma_depcei = pd.Series(erro_relativo_depcei).rolling(window).mean()
-
-plt.plot(erro_ma_saq, label='SAQ', alpha=0.8)
-plt.plot(erro_ma_dep, label='DEP', alpha=0.8)
-plt.plot(erro_ma_saqcei, label='SAQCEI', alpha=0.8)
-plt.plot(erro_ma_depcei, label='DEPCEI', alpha=0.8)
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.5)
-plt.xlabel('Tempo')
-plt.ylabel('Erro Relativo (Média Móvel 30d)')
-plt.title('Evolução dos Erros Relativos')
-plt.legend()
-plt.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-
-# =====================================================
-# DETECÇÃO DE PONTOS DE MUDANÇA
-# =====================================================
-
-def detectar_mudanca(martingale, threshold=20, min_consecutivos=3):
-    """Detecta pontos de mudança quando martingale > threshold"""
-    deteccoes = []
-    consecutivos = 0
-    
-    for i in range(len(martingale)):
-        if martingale[i] > threshold:
-            consecutivos += 1
-            if consecutivos >= min_consecutivos:
-                if len(deteccoes) == 0 or i - deteccoes[-1] > 30:
-                    deteccoes.append(i)
+        # Initialize martingale
+        if martingale_type == 'simple':
+            self.martingale = SimpleMartingale()
+        elif martingale_type == 'mixture':
+            self.martingale = MixtureMartingale()
+        elif martingale_type == 'power':
+            self.martingale = PowerMartingale()
         else:
-            consecutivos = 0
+            raise ValueError(f"Unknown martingale type: {martingale_type}")
+        
+        # Storage for results
+        self.calibration_scores = []
+        self.p_values = []
+        self.timestamps = []
+        self.drift_points = []
+        
+    def compute_nonconformity_score(self, y_true: float, y_pred: float) -> float:
+        """Compute nonconformity score based on selected measure."""
+        if self.nonconformity_measure == 'absolute_residual':
+            return absolute_residual_score(np.array([y_true]), np.array([y_pred]))[0]
+        elif self.nonconformity_measure == 'normalized_residual':
+            return normalized_residual_score(np.array([y_true]), np.array([y_pred]))[0]
+        elif self.nonconformity_measure == 'signed_residual':
+            return signed_residual_score(np.array([y_true]), np.array([y_pred]))[0]
+        else:
+            raise ValueError(f"Unknown nonconformity measure: {self.nonconformity_measure}")
     
-    return deteccoes
+    def process_data_stream(self, data: pd.DataFrame) -> Dict:
+        """
+        Process a stream of data for drift detection.
+        
+        Args:
+            data: DataFrame with columns including predictions and real values
+        
+        Returns:
+            Dictionary with detection results
+        """
+        # Sort by date
+        data = data.sort_values('DATA').reset_index(drop=True)
+        
+        # Initialize with calibration period
+        for i in range(self.calibration_window):
+            score = self.compute_nonconformity_score(
+                data.iloc[i]['VALOR_real'],
+                data.iloc[i]['VALOR_pred']
+            )
+            self.calibration_scores.append(score)
+        
+        # Process remaining data
+        for i in range(self.calibration_window, len(data)):
+            # Compute nonconformity score for new observation
+            score = self.compute_nonconformity_score(
+                data.iloc[i]['VALOR_real'],
+                data.iloc[i]['VALOR_pred']
+            )
+            
+            # Calculate p-value
+            p_value = compute_conformal_pvalue(
+                np.array(self.calibration_scores[-self.calibration_window:]),
+                score
+            )
+            
+            # Update martingale
+            martingale_value = self.martingale.update(p_value)
+            
+            # Store results
+            self.p_values.append(p_value)
+            self.timestamps.append(data.iloc[i]['DATA'])
+            
+            # Check for drift
+            if martingale_value >= self.detection_threshold:
+                self.drift_points.append(i)
+                # Optionally reset martingale after detection
+                # self.martingale.reset()
+            
+            # Update calibration window (sliding window approach)
+            self.calibration_scores.append(score)
+            if len(self.calibration_scores) > self.calibration_window * 2:
+                self.calibration_scores.pop(0)
+        
+        return {
+            'p_values': self.p_values,
+            'martingale_history': self.martingale.history[1:],  # Exclude initial 1.0
+            'timestamps': self.timestamps,
+            'drift_points': self.drift_points
+        }
 
-# Detectar mudanças
-print("\n=== DETECÇÃO DE MUDANÇAS ===")
+# =============================================================================
+# 7. VISUALIZATION FUNCTIONS
+# =============================================================================
 
-# Univariadas
-det_saq = detectar_mudanca(M_power_saq)
-det_dep = detectar_mudanca(M_power_dep)
-det_saqcei = detectar_mudanca(M_power_saqcei)
-det_depcei = detectar_mudanca(M_power_depcei)
+def plot_drift_detection_results(results: Dict, agency_name: str):
+    """
+    Create comprehensive visualization of drift detection results.
+    
+    Args:
+        results: Dictionary with detection results
+        agency_name: Name of the agency being analyzed
+    """
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    
+    # 1. P-values over time
+    ax1 = axes[0]
+    ax1.plot(results['timestamps'], results['p_values'], 'b-', alpha=0.7, linewidth=1)
+    ax1.axhline(y=0.05, color='r', linestyle='--', label='α = 0.05')
+    ax1.fill_between(results['timestamps'], 0, 0.05, alpha=0.2, color='red')
+    
+    # Mark drift points
+    for drift_idx in results['drift_points']:
+        if drift_idx - len(results['timestamps']) + len(results['p_values']) >= 0:
+            adj_idx = drift_idx - len(results['timestamps']) + len(results['p_values'])
+            ax1.axvline(x=results['timestamps'][adj_idx], color='red', 
+                       linestyle=':', alpha=0.7)
+    
+    ax1.set_ylabel('P-value', fontsize=12)
+    ax1.set_title(f'Conformal P-values Over Time - Agency: {agency_name}', fontsize=14)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Martingale evolution (log scale)
+    ax2 = axes[1]
+    ax2.semilogy(results['timestamps'], results['martingale_history'], 
+                 'g-', linewidth=2, label='Martingale Value')
+    ax2.axhline(y=results.get('threshold', 100), color='r', linestyle='--', 
+                label='Detection Threshold')
+    
+    # Mark drift points
+    for drift_idx in results['drift_points']:
+        if drift_idx - len(results['timestamps']) + len(results['p_values']) >= 0:
+            adj_idx = drift_idx - len(results['timestamps']) + len(results['p_values'])
+            ax2.axvline(x=results['timestamps'][adj_idx], color='red', 
+                       linestyle=':', alpha=0.7)
+    
+    ax2.set_ylabel('Martingale Value (log scale)', fontsize=12)
+    ax2.set_title('Martingale Evolution for Drift Detection', fontsize=14)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. P-value distribution histogram
+    ax3 = axes[2]
+    ax3.hist(results['p_values'], bins=30, alpha=0.7, edgecolor='black', density=True)
+    ax3.axvline(x=0.05, color='r', linestyle='--', label='α = 0.05')
+    
+    # Add uniform distribution reference
+    x_uniform = np.linspace(0, 1, 100)
+    ax3.plot(x_uniform, np.ones_like(x_uniform), 'k--', alpha=0.5, 
+             label='Uniform (no drift)')
+    
+    ax3.set_xlabel('P-value', fontsize=12)
+    ax3.set_ylabel('Density', fontsize=12)
+    ax3.set_title('P-value Distribution (Should be Uniform Under No Drift)', fontsize=14)
+    ax3.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f'drift_detection_{agency_name}.png', dpi=300, bbox_inches='tight')
+    plt.show()
 
-# Multivariada
-det_multi_0 = detectar_mudanca(M_power_multi_alpha0)
-det_multi_1 = detectar_mudanca(M_power_multi_alpha1)
+def plot_prediction_analysis(data: pd.DataFrame, agency_name: str, 
+                           drift_points: List[int] = None):
+    """
+    Plot predictions vs real values with drift points marked.
+    
+    Args:
+        data: DataFrame with predictions and real values
+        agency_name: Name of the agency
+        drift_points: List of indices where drift was detected
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+    
+    # 1. Time series of predictions and real values
+    ax1.plot(data['DATA'], data['VALOR_real'], 'b-', label='Real Values', alpha=0.8)
+    ax1.plot(data['DATA'], data['VALOR_pred'], 'r--', label='Predictions', alpha=0.8)
+    
+    # Mark drift points
+    if drift_points:
+        for drift_idx in drift_points:
+            if drift_idx < len(data):
+                ax1.axvline(x=data.iloc[drift_idx]['DATA'], color='orange', 
+                           linestyle=':', alpha=0.7, label='Drift Detected' if drift_idx == drift_points[0] else '')
+    
+    ax1.set_ylabel('Value', fontsize=12)
+    ax1.set_title(f'Predictions vs Real Values - Agency: {agency_name}', fontsize=14)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Residuals over time
+    residuals = data['VALOR_real'] - data['VALOR_pred']
+    ax2.scatter(data['DATA'], residuals, alpha=0.5, s=20)
+    ax2.axhline(y=0, color='k', linestyle='-', alpha=0.5)
+    
+    # Add rolling average of residuals
+    rolling_mean = residuals.rolling(window=30, min_periods=1).mean()
+    ax2.plot(data['DATA'], rolling_mean, 'r-', linewidth=2, label='30-day Rolling Mean')
+    
+    ax2.set_xlabel('Date', fontsize=12)
+    ax2.set_ylabel('Residual (Real - Predicted)', fontsize=12)
+    ax2.set_title('Prediction Residuals Over Time', fontsize=14)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'prediction_analysis_{agency_name}.png', dpi=300, bbox_inches='tight')
+    plt.show()
 
-# Visualizar detecções
-plt.figure(figsize=(14, 8))
+# =============================================================================
+# 8. MAIN ANALYSIS FUNCTION
+# =============================================================================
 
-# Criar timeline
-tempo = np.arange(len(df_agencia))
-plt.scatter(tempo, np.zeros_like(tempo), alpha=0.1, s=1, c='gray')
+def analyze_agency_drift(data: pd.DataFrame, agency_id: str, 
+                        martingale_type: str = 'simple',
+                        threshold: float = 100) -> Dict:
+    """
+    Perform complete drift analysis for a specific agency.
+    
+    Args:
+        data: Merged DataFrame with predictions and real values
+        agency_id: Agency identifier to analyze
+        martingale_type: Type of martingale to use
+        threshold: Detection threshold
+    
+    Returns:
+        Dictionary with analysis results
+    """
+    # Filter data for specific agency
+    agency_data = data[data['AGENCIA'] == agency_id].copy()
+    
+    if len(agency_data) < 100:
+        print(f"Warning: Agency {agency_id} has only {len(agency_data)} observations.")
+        return None
+    
+    print(f"\nAnalyzing Agency: {agency_id}")
+    print(f"Data points: {len(agency_data)}")
+    print(f"Date range: {agency_data['DATA'].min()} to {agency_data['DATA'].max()}")
+    
+    # Initialize drift detector
+    detector = ConformalDriftDetector(
+        nonconformity_measure='absolute_residual',
+        martingale_type=martingale_type,
+        detection_threshold=threshold,
+        calibration_window=min(500, len(agency_data) // 3)
+    )
+    
+    # Process data stream
+    results = detector.process_data_stream(agency_data)
+    results['threshold'] = threshold
+    
+    # Calculate drift statistics
+    n_drifts = len(results['drift_points'])
+    drift_rate = n_drifts / len(results['p_values']) if results['p_values'] else 0
+    
+    print(f"\nDrift Detection Results:")
+    print(f"- Number of drift points detected: {n_drifts}")
+    print(f"- Drift rate: {drift_rate:.2%}")
+    print(f"- Average p-value: {np.mean(results['p_values']):.3f}")
+    print(f"- Max martingale value: {max(results['martingale_history']):.2f}")
+    
+    # Create visualizations
+    plot_drift_detection_results(results, agency_id)
+    plot_prediction_analysis(agency_data, agency_id, results['drift_points'])
+    
+    return results
 
-# Marcar detecções univariadas
-if det_saq: plt.scatter(det_saq, [1]*len(det_saq), label='SAQ', s=100, alpha=0.7)
-if det_dep: plt.scatter(det_dep, [2]*len(det_dep), label='DEP', s=100, alpha=0.7)
-if det_saqcei: plt.scatter(det_saqcei, [3]*len(det_saqcei), label='SAQCEI', s=100, alpha=0.7)
-if det_depcei: plt.scatter(det_depcei, [4]*len(det_depcei), label='DEPCEI', s=100, alpha=0.7)
+# =============================================================================
+# 9. MAIN EXECUTION
+# =============================================================================
 
-# Marcar detecções multivariadas
-if det_multi_0: plt.scatter(det_multi_0, [5]*len(det_multi_0), label='Multi α=0', s=150, marker='^')
-if det_multi_1: plt.scatter(det_multi_1, [6]*len(det_multi_1), label='Multi α=1', s=150, marker='^')
+def main():
+    """Main execution function."""
+    
+    # File paths
+    predictions_path = "previsoes_numerario_pre_pos_pandemia.csv"
+    features_path = "features_numerario.parquet"
+    
+    try:
+        # Load and merge data
+        merged_data = load_and_merge_data(predictions_path, features_path)
+        
+        # Select an agency for detailed analysis
+        # You can modify this to analyze multiple agencies
+        agencies = merged_data['AGENCIA'].unique()
+        print(f"\nAvailable agencies: {len(agencies)}")
+        print(f"First 10 agencies: {agencies[:10]}")
+        
+        # Analyze the agency with most data points
+        agency_counts = merged_data['AGENCIA'].value_counts()
+        selected_agency = agency_counts.index[0]
+        
+        print(f"\nSelected agency for analysis: {selected_agency}")
+        print(f"Number of observations: {agency_counts.iloc[0]}")
+        
+        # Perform drift analysis
+        results = analyze_agency_drift(
+            merged_data,
+            selected_agency,
+            martingale_type='simple',
+            threshold=100
+        )
+        
+        # Optionally analyze multiple agencies
+        print("\n" + "="*60)
+        print("SUMMARY OF TOP 5 AGENCIES")
+        print("="*60)
+        
+        summary_results = []
+        for agency in agency_counts.index[:5]:
+            agency_data = merged_data[merged_data['AGENCIA'] == agency]
+            if len(agency_data) >= 100:
+                detector = ConformalDriftDetector()
+                results = detector.process_data_stream(agency_data)
+                
+                summary_results.append({
+                    'agency': agency,
+                    'n_observations': len(agency_data),
+                    'n_drifts': len(results['drift_points']),
+                    'drift_rate': len(results['drift_points']) / len(results['p_values']),
+                    'avg_p_value': np.mean(results['p_values'])
+                })
+        
+        # Display summary
+        summary_df = pd.DataFrame(summary_results)
+        print(summary_df.to_string(index=False))
+        
+    except FileNotFoundError as e:
+        print(f"Error: Could not find data file - {e}")
+        print("Please ensure the following files are in the current directory:")
+        print("- previsoes_numerario_pre_pos_pandemia.csv")
+        print("- features_numerario.parquet")
+    except Exception as e:
+        print(f"Error during analysis: {e}")
+        import traceback
+        traceback.print_exc()
 
-plt.axvline(change_point, color='black', linestyle='--', alpha=0.5, label='Possível Drift')
-
-plt.ylim(-0.5, 6.5)
-plt.xlabel('Tempo')
-plt.yticks(range(7), ['', 'SAQ', 'DEP', 'SAQCEI', 'DEPCEI', 'Multi α=0', 'Multi α=1'])
-plt.title('Timeline de Detecções de Drift')
-plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-plt.grid(True, axis='x', alpha=0.3)
-plt.tight_layout()
-plt.show()
-
-# Resumo
-print(f"\nDetecções encontradas:")
-print(f"SAQ: {len(det_saq)} detecções")
-print(f"DEP: {len(det_dep)} detecções")
-print(f"SAQCEI: {len(det_saqcei)} detecções")
-print(f"DEPCEI: {len(det_depcei)} detecções")
-print(f"Multivariada (α=0): {len(det_multi_0)} detecções")
-print(f"Multivariada (α=1): {len(det_multi_1)} detecções")
+if __name__ == "__main__":
+    main()
