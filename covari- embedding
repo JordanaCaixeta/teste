@@ -1,0 +1,784 @@
+# =============================================================================
+
+# ANÁLISE DE COVARIATE SHIFT - EMBEDDING DE RETORNO
+
+# Detecção de mudanças nas features de embedding (espaço fase com retorno)
+
+# =============================================================================
+
+def calcular_embedding_retorno(df_merged, variaveis=[‘SAQ’, ‘DEP’, ‘SAQCEI’, ‘DEPCEI’],
+lags=range(2, 19)):
+“””
+Calcula features de embedding de retorno conforme implementado no modelo Numerários.
+Baseado na função calculate_lags_ret do contexto fornecido.
+
+```
+Args:
+    df_merged: DataFrame com dados reais
+    variaveis: Lista de variáveis target para calcular embedding
+    lags: Range de defasagens (padrão: 2 a 19 = 17 features por variável)
+
+Returns:
+    df_embedding: DataFrame com features de embedding
+    info_embedding: Informações sobre as features criadas
+"""
+print("\n🧮 CALCULANDO EMBEDDING DE RETORNO")
+print("="*50)
+
+df_embedding = df_merged[['AGENCIA', 'DATA']].copy()
+features_criadas = []
+
+for variavel in variaveis:
+    if f'{variavel}_REAL' not in df_merged.columns:
+        print(f"⚠️  Variável {variavel}_REAL não encontrada, pulando...")
+        continue
+        
+    print(f"▶️  Calculando embedding para {variavel}...")
+    
+    # Usar valores reais para calcular embedding
+    serie = df_merged[f'{variavel}_REAL'].values
+    
+    # Calcular features de retorno conforme função original
+    for lag in lags:
+        feature_name = f"ret_{lag-2}_{variavel}"
+        
+        # Implementação baseada na função original:
+        # ret_{i}_{label} = x(t-i) / (x(t-i-1) + 1)
+        if lag < len(serie):
+            retorno = np.zeros(len(serie))
+            for t in range(lag, len(serie)):
+                valor_atual = serie[t - (lag-2)]  # x(t-i)
+                valor_anterior = serie[t - (lag-1)]  # x(t-i-1)
+                retorno[t] = valor_atual / (valor_anterior + 1)  # +1 para evitar divisão por 0
+            
+            df_embedding[feature_name] = retorno
+            features_criadas.append(feature_name)
+
+print(f"✓ Features de embedding criadas: {len(features_criadas)}")
+print(f"  Variáveis processadas: {len([v for v in variaveis if f'{v}_REAL' in df_merged.columns])}")
+print(f"  Defasagens por variável: {len(lags)}")
+
+# Remover linhas com NaN/Inf (primeiras observações)
+df_embedding = df_embedding.replace([np.inf, -np.inf], np.nan)
+df_embedding = df_embedding.dropna()
+
+info_embedding = {
+    'total_features': len(features_criadas),
+    'features_nomes': features_criadas,
+    'variaveis_base': variaveis,
+    'lags_utilizados': list(lags),
+    'total_observacoes': len(df_embedding),
+    'periodo': (df_embedding['DATA'].min(), df_embedding['DATA'].max()),
+    'agencia': df_embedding['AGENCIA'].iloc[0] if len(df_embedding['AGENCIA'].unique()) == 1 else 'Múltiplas'
+}
+
+print(f"✓ Dataset final: {info_embedding['total_observacoes']} observações")
+print(f"✓ Período: {info_embedding['periodo'][0]} a {info_embedding['periodo'][1]}")
+
+return df_embedding, info_embedding
+```
+
+def calcular_embedding_avancado(df_merged, variaveis=[‘SAQ’, ‘DEP’, ‘SAQCEI’, ‘DEPCEI’]):
+“””
+Calcula features de embedding mais avançadas incluindo:
+- Retorno simples
+- Retorno logarítmico
+- Volatilidade rolling
+- Momentum
+
+```
+Args:
+    df_merged: DataFrame com dados
+    variaveis: Variáveis para calcular embedding
+
+Returns:
+    df_embedding_avancado: DataFrame com features avançadas
+    info_avancado: Informações sobre features
+"""
+print("\n🔬 CALCULANDO EMBEDDING AVANÇADO")
+print("="*45)
+
+df_embedding = df_merged[['AGENCIA', 'DATA']].copy()
+features_criadas = []
+
+for variavel in variaveis:
+    if f'{variavel}_REAL' not in df_merged.columns:
+        continue
+        
+    print(f"▶️  Processando {variavel}...")
+    serie = df_merged[f'{variavel}_REAL'].values
+    
+    # 1. Retornos simples (diferentes horizontes)
+    for lag in [1, 3, 7, 14, 30]:
+        feature_name = f"ret_simple_{lag}d_{variavel}"
+        retorno = np.zeros(len(serie))
+        for t in range(lag, len(serie)):
+            if serie[t-lag] != 0:
+                retorno[t] = (serie[t] - serie[t-lag]) / serie[t-lag]
+            else:
+                retorno[t] = 0
+        df_embedding[feature_name] = retorno
+        features_criadas.append(feature_name)
+    
+    # 2. Retornos logarítmicos
+    for lag in [1, 7, 30]:
+        feature_name = f"ret_log_{lag}d_{variavel}"
+        retorno_log = np.zeros(len(serie))
+        for t in range(lag, len(serie)):
+            if serie[t-lag] > 0 and serie[t] > 0:
+                retorno_log[t] = np.log(serie[t] / serie[t-lag])
+            else:
+                retorno_log[t] = 0
+        df_embedding[feature_name] = retorno_log
+        features_criadas.append(feature_name)
+    
+    # 3. Volatilidade rolling (desvio padrão dos retornos)
+    for window in [7, 30]:
+        feature_name = f"volatilidade_{window}d_{variavel}"
+        # Calcular retornos diários primeiro
+        ret_diario = np.zeros(len(serie))
+        for t in range(1, len(serie)):
+            if serie[t-1] != 0:
+                ret_diario[t] = (serie[t] - serie[t-1]) / serie[t-1]
+        
+        # Rolling std
+        volatilidade = np.zeros(len(serie))
+        for t in range(window, len(serie)):
+            volatilidade[t] = np.std(ret_diario[t-window:t])
+        
+        df_embedding[feature_name] = volatilidade
+        features_criadas.append(feature_name)
+    
+    # 4. Momentum (tendência)
+    for window in [7, 14, 30]:
+        feature_name = f"momentum_{window}d_{variavel}"
+        momentum = np.zeros(len(serie))
+        for t in range(window, len(serie)):
+            # Inclinação da regressão linear nos últimos 'window' dias
+            y = serie[t-window:t]
+            x = np.arange(window)
+            if len(y) == window:
+                coef = np.polyfit(x, y, 1)[0]  # Coeficiente angular
+                momentum[t] = coef
+        
+        df_embedding[feature_name] = momentum
+        features_criadas.append(feature_name)
+    
+    # 5. Razão entre períodos (captura mudanças de regime)
+    for lag_curto, lag_longo in [(7, 30), (14, 90)]:
+        feature_name = f"razao_{lag_curto}_{lag_longo}d_{variavel}"
+        razao = np.zeros(len(serie))
+        for t in range(lag_longo, len(serie)):
+            media_curta = np.mean(serie[t-lag_curto:t])
+            media_longa = np.mean(serie[t-lag_longo:t])
+            if media_longa != 0:
+                razao[t] = media_curta / media_longa
+            else:
+                razao[t] = 1.0
+        
+        df_embedding[feature_name] = razao
+        features_criadas.append(feature_name)
+
+# Limpeza e tratamento
+df_embedding = df_embedding.replace([np.inf, -np.inf], np.nan)
+df_embedding = df_embedding.dropna()
+
+info_avancado = {
+    'total_features': len(features_criadas),
+    'features_nomes': features_criadas,
+    'tipos_features': {
+        'retorno_simples': len([f for f in features_criadas if 'ret_simple' in f]),
+        'retorno_log': len([f for f in features_criadas if 'ret_log' in f]),
+        'volatilidade': len([f for f in features_criadas if 'volatilidade' in f]),
+        'momentum': len([f for f in features_criadas if 'momentum' in f]),
+        'razao': len([f for f in features_criadas if 'razao' in f])
+    },
+    'total_observacoes': len(df_embedding),
+    'periodo': (df_embedding['DATA'].min(), df_embedding['DATA'].max())
+}
+
+print(f"✓ Features avançadas criadas: {len(features_criadas)}")
+for tipo, count in info_avancado['tipos_features'].items():
+    print(f"  - {tipo}: {count} features")
+
+return df_embedding, info_avancado
+```
+
+def executar_analise_embedding_shift(df_embedding, info_embedding,
+tipo_embedding=‘basico’,
+epsilon=0.92, threshold_mult=20,
+min_consecutivos=3, janela_deteccao=30):
+“””
+Executa análise de covariate shift específica para features de embedding.
+
+```
+Args:
+    df_embedding: DataFrame com features de embedding
+    info_embedding: Informações sobre o embedding
+    tipo_embedding: 'basico' ou 'avancado'
+    epsilon: Parâmetro do power martingale
+    threshold_mult: Multiplicador do threshold
+    min_consecutivos: Mínimo de detecções consecutivas
+    janela_deteccao: Janela para detecção adaptativa
+
+Returns:
+    resultados_embedding: Dicionário com resultados
+"""
+print(f"\n📊 ANÁLISE DE EMBEDDING SHIFT ({tipo_embedding.upper()})")
+print("="*55)
+
+# Selecionar apenas features de embedding
+features_embedding = [col for col in df_embedding.columns 
+                     if col not in ['AGENCIA', 'DATA']]
+
+if not features_embedding:
+    print("⚠️  Nenhuma feature de embedding encontrada!")
+    return None
+
+df_features_only = df_embedding[features_embedding].copy()
+
+print(f"▶️  Analisando {len(features_embedding)} features de embedding...")
+print(f"   Tipos: {', '.join(list(set([f.split('_')[0] for f in features_embedding[:10]])))}")
+
+# =========================
+# ANÁLISE ESTATÍSTICA PRÉVIA
+# =========================
+print("\n📈 Análise estatística das features...")
+
+stats_features = {}
+for feature in features_embedding[:5]:  # Mostrar apenas primeiras 5
+    serie = df_features_only[feature].dropna()
+    if len(serie) > 0:
+        stats_features[feature] = {
+            'mean': np.mean(serie),
+            'std': np.std(serie),
+            'min': np.min(serie),
+            'max': np.max(serie),
+            'zeros': np.sum(serie == 0) / len(serie) * 100
+        }
+        print(f"  {feature}: μ={stats_features[feature]['mean']:.4f}, "
+              f"σ={stats_features[feature]['std']:.4f}, "
+              f"zeros={stats_features[feature]['zeros']:.1f}%")
+
+# =========================
+# CALCULAR P-VALORES
+# =========================
+print("\n🔢 Calculando p-valores para embedding...")
+
+# Usar função existente
+p_det_embedding, p_rnd_embedding = calcular_pvalores_multivariado_scores(df_features_only)
+
+print(f"✓ P-valores calculados para {len(df_features_only)} observações")
+
+# =========================
+# MARTINGALES
+# =========================
+print("\n📈 Calculando martingales...")
+
+# Power Martingale
+mart_power_embedding = power_martingale(p_rnd_embedding, epsilon)
+
+# Simple Jumper Martingale  
+mart_jumper_embedding = simple_jumper_martingale(p_rnd_embedding)
+
+print(f"✓ Power Martingale - max: {np.max(mart_power_embedding):.2e}")
+print(f"✓ Simple Jumper - max: {np.max(mart_jumper_embedding):.2e}")
+
+# =========================
+# DETECÇÃO DE MUDANÇA
+# =========================
+print("\n🎯 Detectando mudanças no embedding...")
+
+# Power Martingale
+deteccoes_power, info_power = detectar_mudanca_adaptativa(
+    mart_power_embedding,
+    janela=janela_deteccao,
+    threshold_mult=threshold_mult,
+    min_consecutivos=min_consecutivos
+)
+
+# Simple Jumper
+deteccoes_jumper, info_jumper = detectar_mudanca_adaptativa(
+    mart_jumper_embedding,
+    janela=janela_deteccao,
+    threshold_mult=threshold_mult,
+    min_consecutivos=min_consecutivos
+)
+
+print(f"\n📊 DETECÇÕES NO EMBEDDING:")
+print(f"  Power Martingale: {len(deteccoes_power)} detecções")
+if deteccoes_power:
+    primeira_power = deteccoes_power[0]
+    data_primeira = df_embedding.iloc[primeira_power]['DATA']
+    print(f"    Primeira: índice {primeira_power} ({data_primeira})")
+
+print(f"  Simple Jumper: {len(deteccoes_jumper)} detecções")
+if deteccoes_jumper:
+    primeira_jumper = deteccoes_jumper[0]
+    data_primeira_j = df_embedding.iloc[primeira_jumper]['DATA']
+    print(f"    Primeira: índice {primeira_jumper} ({data_primeira_j})")
+
+# =========================
+# ANÁLISE DE FEATURES MAIS AFETADAS
+# =========================
+print("\n🔍 Analisando features mais afetadas...")
+
+features_impacto = analisar_impacto_features_embedding(
+    df_features_only, deteccoes_power, features_embedding
+)
+
+# Compilar resultados
+resultados_embedding = {
+    'tipo': tipo_embedding,
+    'info_dataset': info_embedding,
+    'features_analisadas': features_embedding,
+    'stats_features': stats_features,
+    'p_valores': {
+        'deterministic': p_det_embedding,
+        'randomized': p_rnd_embedding
+    },
+    'martingales': {
+        'power': mart_power_embedding,
+        'jumper': mart_jumper_embedding
+    },
+    'deteccoes': {
+        'power': deteccoes_power,
+        'jumper': deteccoes_jumper
+    },
+    'info_deteccao': {
+        'power': info_power,
+        'jumper': info_jumper
+    },
+    'impacto_features': features_impacto,
+    'config': {
+        'epsilon': epsilon,
+        'threshold_mult': threshold_mult,
+        'min_consecutivos': min_consecutivos,
+        'janela_deteccao': janela_deteccao
+    }
+}
+
+return resultados_embedding
+```
+
+def analisar_impacto_features_embedding(df_features, deteccoes, features_nomes):
+“””
+Analisa quais features de embedding têm maior impacto nas detecções.
+
+```
+Args:
+    df_features: DataFrame com features
+    deteccoes: Lista de índices de detecção
+    features_nomes: Lista de nomes das features
+
+Returns:
+    impacto: Dicionário com análise de impacto
+"""
+if not deteccoes:
+    return {'nenhuma_deteccao': True}
+
+impacto = {}
+
+# Analisar mudanças por tipo de feature
+tipos_features = {}
+for feature in features_nomes:
+    tipo = feature.split('_')[0]  # ret, volatilidade, momentum, etc.
+    if tipo not in tipos_features:
+        tipos_features[tipo] = []
+    tipos_features[tipo].append(feature)
+
+print(f"  Tipos de features identificados: {list(tipos_features.keys())}")
+
+# Para cada detecção, analisar impacto por tipo
+for i, det_idx in enumerate(deteccoes[:3]):
+    if det_idx < 30:
+        continue
+        
+    periodo_antes = df_features.iloc[det_idx-30:det_idx]
+    periodo_durante = df_features.iloc[det_idx:det_idx+10]
+    
+    mudancas_por_tipo = {}
+    
+    for tipo, features_tipo in tipos_features.items():
+        mudancas_tipo = []
+        
+        for feature in features_tipo:
+            if feature in df_features.columns:
+                # Mudança na média
+                media_antes = periodo_antes[feature].mean()
+                media_durante = periodo_durante[feature].mean()
+                
+                # Mudança na volatilidade
+                std_antes = periodo_antes[feature].std()
+                std_durante = periodo_durante[feature].std()
+                
+                mudanca_media = abs(media_durante - media_antes) / (abs(media_antes) + 1e-8)
+                mudanca_vol = abs(std_durante - std_antes) / (abs(std_antes) + 1e-8)
+                
+                mudancas_tipo.append({
+                    'feature': feature,
+                    'mudanca_media': mudanca_media,
+                    'mudanca_volatilidade': mudanca_vol,
+                    'mudanca_total': mudanca_media + mudanca_vol
+                })
+        
+        if mudancas_tipo:
+            # Agregar por tipo
+            mudancas_por_tipo[tipo] = {
+                'mudanca_media_total': sum(m['mudanca_media'] for m in mudancas_tipo),
+                'mudanca_vol_total': sum(m['mudanca_volatilidade'] for m in mudancas_tipo),
+                'features_count': len(mudancas_tipo),
+                'top_feature': max(mudancas_tipo, key=lambda x: x['mudanca_total'])
+            }
+    
+    impacto[f'deteccao_{i+1}'] = {
+        'indice': det_idx,
+        'mudancas_por_tipo': mudancas_por_tipo
+    }
+
+# Ranking geral dos tipos mais afetados
+if impacto:
+    ranking_tipos = {}
+    for det_info in impacto.values():
+        if isinstance(det_info, dict) and 'mudancas_por_tipo' in det_info:
+            for tipo, info_tipo in det_info['mudancas_por_tipo'].items():
+                if tipo not in ranking_tipos:
+                    ranking_tipos[tipo] = 0
+                ranking_tipos[tipo] += info_tipo['mudanca_media_total']
+    
+    if ranking_tipos:
+        tipo_mais_afetado = max(ranking_tipos, key=ranking_tipos.get)
+        impacto['tipo_mais_afetado'] = {
+            'tipo': tipo_mais_afetado,
+            'impacto_total': ranking_tipos[tipo_mais_afetado]
+        }
+        
+        print(f"  🎯 Tipo de feature mais afetado: {tipo_mais_afetado}")
+
+return impacto
+```
+
+def plot_embedding_shift_analysis(resultados_embedding, df_embedding):
+“””
+Visualizações específicas para análise de embedding shift.
+
+```
+Args:
+    resultados_embedding: Resultados da análise
+    df_embedding: DataFrame com embedding e datas
+"""
+print("\n📈 GERANDO VISUALIZAÇÕES DE EMBEDDING SHIFT...")
+
+fig = plt.figure(figsize=(20, 16))
+gs = fig.add_gridspec(4, 2, hspace=0.4, wspace=0.3)
+
+# 1. Evolução dos Martingales
+ax1 = fig.add_subplot(gs[0, :])
+
+mart_power = resultados_embedding['martingales']['power']
+mart_jumper = resultados_embedding['martingales']['jumper']
+
+ax1.plot(mart_power, label='Power Martingale', linewidth=2, color='blue')
+ax1.plot(mart_jumper, label='Simple Jumper', linewidth=2, color='red', linestyle='--')
+
+# Marcar detecções
+for det_idx in resultados_embedding['deteccoes']['power']:
+    ax1.axvline(det_idx, color='blue', linestyle=':', alpha=0.7)
+
+for det_idx in resultados_embedding['deteccoes']['jumper']:
+    ax1.axvline(det_idx, color='red', linestyle=':', alpha=0.7)
+
+ax1.set_yscale('log')
+ax1.set_xlabel('Tempo')
+ax1.set_ylabel('Martingale (log)')
+ax1.set_title(f'Evolução dos Martingales - Embedding Shift ({resultados_embedding["tipo"].title()})')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# 2. P-valores
+ax2 = fig.add_subplot(gs[1, 0])
+p_rnd = resultados_embedding['p_valores']['randomized']
+ax2.plot(p_rnd, color='green', alpha=0.7)
+ax2.axhline(y=0.05, color='red', linestyle='--', alpha=0.5)
+ax2.set_xlabel('Tempo')
+ax2.set_ylabel('P-valor')
+ax2.set_title('P-valores - Embedding')
+ax2.grid(True, alpha=0.3)
+
+# 3. Distribuição de Features (primeiras 5)
+ax3 = fig.add_subplot(gs[1, 1])
+features_mostrar = list(resultados_embedding['features_analisadas'][:5])
+
+if features_mostrar and 'stats_features' in resultados_embedding:
+    stats = resultados_embedding['stats_features']
+    means = [stats[f]['mean'] for f in features_mostrar if f in stats]
+    stds = [stats[f]['std'] for f in features_mostrar if f in stats]
+    
+    if means:
+        ax3.errorbar(range(len(means)), means, yerr=stds, 
+                    capsize=5, marker='o', linestyle='none')
+        ax3.set_xticks(range(len(features_mostrar)))
+        ax3.set_xticklabels([f[:15] + '...' if len(f) > 15 else f 
+                           for f in features_mostrar], rotation=45)
+        ax3.set_ylabel('Valor (μ ± σ)')
+        ax3.set_title('Distribuição das Features')
+
+# 4. Impacto por Tipo de Feature
+ax4 = fig.add_subplot(gs[2, :])
+
+if 'tipo_mais_afetado' in resultados_embedding['impacto_features']:
+    # Criar gráfico de barras com tipos de features
+    impacto = resultados_embedding['impacto_features']
+    tipos_impacto = {}
+    
+    for det_key, det_info in impacto.items():
+        if det_key.startswith('deteccao_') and isinstance(det_info, dict):
+            if 'mudancas_por_tipo' in det_info:
+                for tipo, info_tipo in det_info['mudancas_por_tipo'].items():
+                    if tipo not in tipos_impacto:
+                        tipos_impacto[tipo] = 0
+                    tipos_impacto[tipo] += info_tipo['mudanca_media_total']
+    
+    if tipos_impacto:
+        tipos = list(tipos_impacto.keys())
+        valores = list(tipos_impacto.values())
+        
+        bars = ax4.bar(tipos, valores, alpha=0.7)
+        ax4.set_xlabel('Tipo de Feature')
+        ax4.set_ylabel('Impacto Total')
+        ax4.set_title('Impacto por Tipo de Feature de Embedding')
+        
+        # Destacar o tipo mais afetado
+        max_idx = valores.index(max(valores))
+        bars[max_idx].set_color('red')
+else:
+    ax4.text(0.5, 0.5, 'Nenhuma detecção\npara análise', 
+            ha='center', va='center', transform=ax4.transAxes)
+    ax4.set_title('Impacto por Tipo de Feature')
+
+# 5. Timeline de Features Específicas (mostra algumas features importantes)
+ax5 = fig.add_subplot(gs[3, :])
+
+features_importantes = [f for f in resultados_embedding['features_analisadas'] 
+                      if any(keyword in f for keyword in ['ret_1', 'volatilidade_7', 'momentum_14'])]
+
+if features_importantes and len(features_importantes) <= 3:
+    for i, feature in enumerate(features_importantes):
+        if feature in df_embedding.columns:
+            serie = df_embedding[feature].values
+            ax5.plot(serie, label=feature, alpha=0.7)
+    
+    # Marcar detecções
+    for det_idx in resultados_embedding['deteccoes']['power']:
+        ax5.axvline(det_idx, color='red', linestyle='--', alpha=0.5)
+    
+    ax5.set_xlabel('Tempo')
+    ax5.set_ylabel('Valor da Feature')
+    ax5.set_title('Evolução de Features Importantes do Embedding')
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+else:
+    ax5.text(0.5, 0.5, f'Muitas features para mostrar\n({len(resultados_embedding["features_analisadas"])} total)', 
+            ha='center', va='center', transform=ax5.transAxes)
+
+plt.suptitle(f'Análise de Embedding Shift - Modelo Numerários ({resultados_embedding["tipo"].title()})', 
+             fontsize=16)
+plt.tight_layout()
+plt.show()
+```
+
+# =============================================================================
+
+# INTEGRAÇÃO COMPLETA: CALENDÁRIO + EMBEDDING
+
+# =============================================================================
+
+def executar_analise_covariate_completa(df_merged,
+incluir_calendario=True,
+incluir_embedding_basico=True,
+incluir_embedding_avancado=True,
+epsilon=0.92, threshold_mult=20,
+min_consecutivos=3):
+“””
+Executa análise completa de covariate shift incluindo:
+- Features de calendário
+- Features de embedding básico  
+- Features de embedding avançado
+
+```
+Args:
+    df_merged: DataFrame com dados
+    incluir_calendario: Se deve incluir features de calendário
+    incluir_embedding_basico: Se deve incluir embedding básico
+    incluir_embedding_avancado: Se deve incluir embedding avançado
+    epsilon, threshold_mult, min_consecutivos: Parâmetros de detecção
+
+Returns:
+    resultados_completos: Dicionário com todos os resultados
+"""
+print("\n🚀 ANÁLISE COMPLETA DE COVARIATE SHIFT")
+print("📊 Calendário + Embedding Básico + Embedding Avançado")
+print("="*65)
+
+resultados_completos = {}
+
+# 1. Análise de features de calendário (do código anterior)
+if incluir_calendario:
+    print("\n1️⃣  ANÁLISE DE FEATURES DE CALENDÁRIO")
+    df_features_cal, info_cal = preparar_dados_covariate_shift(df_merged)
+    if df_features_cal is not None:
+        resultado_calendario = executar_analise_covariate_shift(
+            df_features_cal, info_cal, epsilon, threshold_mult, min_consecutivos
+        )
+        resultados_completos['calendario'] = resultado_calendario
+
+# 2. Análise de embedding básico
+if incluir_embedding_basico:
+    print("\n2️⃣  ANÁLISE DE EMBEDDING BÁSICO")
+    df_embedding_bas, info_emb_bas = calcular_embedding_retorno(df_merged)
+    if df_embedding_bas is not None:
+        resultado_embedding_bas = executar_analise_embedding_shift(
+            df_embedding_bas, info_emb_bas, 'basico', 
+            epsilon, threshold_mult, min_consecutivos
+        )
+        resultados_completos['embedding_basico'] = resultado_embedding_bas
+        plot_embedding_shift_analysis(resultado_embedding_bas, df_embedding_bas)
+
+# 3. Análise de embedding avançado
+if incluir_embedding_avancado:
+    print("\n3️⃣  ANÁLISE DE EMBEDDING AVANÇADO")
+    df_embedding_avc, info_emb_avc = calcular_embedding_avancado(df_merged)
+    if df_embedding_avc is not None:
+        resultado_embedding_avc = executar_analise_embedding_shift(
+            df_embedding_avc, info_emb_avc, 'avancado',
+            epsilon, threshold_mult, min_consecutivos
+        )
+        resultados_completos['embedding_avancado'] = resultado_embedding_avc
+        plot_embedding_shift_analysis(resultado_embedding_avc, df_embedding_avc)
+
+# 4. Comparação entre todos os tipos
+print("\n📊 COMPARAÇÃO ENTRE TIPOS DE COVARIATE SHIFT")
+print("="*55)
+
+resumo_comparativo = {}
+for tipo, resultado in resultados_completos.items():
+    if resultado and 'deteccoes' in resultado:
+        det_power = len(resultado['deteccoes']['power'])
+        det_jumper = len(resultado['deteccoes']['jumper'])
+        primeira_power = resultado['deteccoes']['power'][0] if det_power > 0 else None
+        
+        resumo_comparativo[tipo] = {
+            'deteccoes_power': det_power,
+            'deteccoes_jumper': det_jumper,
+            'primeira_deteccao': primeira_power,
+            'total_features': resultado['info_dataset']['total_features']
+        }
+        
+        print(f"\n{tipo.upper()}:")
+        print(f"  Features analisadas: {resumo_comparativo[tipo]['total_features']}")
+        print(f"  Detecções Power: {det_power}")
+        print(f"  Detecções Jumper: {det_jumper}")
+        if primeira_power:
+            print(f"  Primeira detecção: índice {primeira_power}")
+
+# 5. Detecção mais sensível
+if resumo_comparativo:
+    # Encontrar tipo com detecção mais precoce
+    tipos_com_deteccao = {k: v for k, v in resumo_comparativo.items() 
+                         if v['primeira_deteccao'] is not None}
+    
+    if tipos_com_deteccao:
+        tipo_mais_sensivel = min(tipos_com_deteccao.keys(), 
+                               key=lambda k: tipos_com_deteccao[k]['primeira_deteccao'])
+        
+        print(f"\n🏆 TIPO MAIS SENSÍVEL: {tipo_mais_sensivel.upper()}")
+        print(f"   Primeira detecção: índice {tipos_com_deteccao[tipo_mais_sensivel]['primeira_deteccao']}")
+        
+        resultados_completos['mais_sensivel'] = {
+            'tipo': tipo_mais_sensivel,
+            'indice_deteccao': tipos_com_deteccao[tipo_mais_sensivel]['primeira_deteccao']
+        }
+
+resultados_completos['resumo_comparativo'] = resumo_comparativo
+
+return resultados_completos
+```
+
+# =============================================================================
+
+# FUNÇÃO PRINCIPAL PARA USAR NO CÓDIGO JOJOJO
+
+# =============================================================================
+
+def main_com_embedding_shift():
+“””
+Função principal que inclui análise de embedding shift.
+Para ser usada no lugar da main() original.
+“””
+print(“🏁 ANÁLISE COMPLETA: DRIFT + COVARIATE SHIFT + EMBEDDING SHIFT”)
+print(”=”*75)
+
+```
+# 1. Carregar dados
+features_df, previsoes_df = carregar_dados()
+
+# 2. Combinar dados
+df_merged = merge_real_previsto(features_df, previsoes_df)
+
+# 3. Filtrar agência específica
+AGENCIA_ANALISE = 20
+df_merged = df_merged[df_merged['AGENCIA'] == AGENCIA_ANALISE].copy()
+print(f"\n📍 Analisando AGÊNCIA {AGENCIA_ANALISE}")
+print(f"   Total de registros: {len(df_merged)}")
+
+# 4. Análise de drift nas targets (original)
+print("\n🎯 ANÁLISE DE DRIFT NAS TARGETS...")
+resultados_drift = executar_analise_drift(
+    df_merged, [7, 30, 90], 0.92, 20, 3
+)
+
+# 5. Análise completa de covariate shift
+print("\n🔄 ANÁLISE COMPLETA DE COVARIATE SHIFT...")
+resultados_covariate = executar_analise_covariate_completa(
+    df_merged, 
+    incluir_calendario=True,
+    incluir_embedding_basico=True,
+    incluir_embedding_avancado=True
+)
+
+# 6. Resumo final integrado
+print("\n📋 RESUMO FINAL INTEGRADO")
+print("="*50)
+
+# Drift targets
+total_det_targets = sum(len(res['deteccoes']) for res in resultados_drift['univariado'].values())
+det_multi_targets = len(resultados_drift['multivariado']['deteccoes'])
+
+print(f"DRIFT NAS TARGETS:")
+print(f"  Univariado: {total_det_targets} detecções")
+print(f"  Multivariado: {det_multi_targets} detecções")
+
+# Covariate shift
+print(f"\nCOVARIATE SHIFT:")
+for tipo, resumo in resultados_covariate.get('resumo_comparativo', {}).items():
+    print(f"  {tipo}: {resumo['deteccoes_power']} detecções (Power)")
+
+# Tipo mais sensível
+if 'mais_sensivel' in resultados_covariate:
+    print(f"\n🏆 Mais sensível: {resultados_covariate['mais_sensivel']['tipo']}")
+
+resultados_finais = {
+    'drift_targets': resultados_drift,
+    'covariate_shift_completo': resultados_covariate
+}
+
+return resultados_finais, df_merged
+```
+
+# Para usar no código jojojo, substituir:
+
+# resultados, df_merged = main()
+
+# por:
+
+# resultados_finais, df_merged = main_com_embedding_shift()
