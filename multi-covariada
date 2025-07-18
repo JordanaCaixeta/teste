@@ -1,0 +1,554 @@
+# =============================================================================
+
+# PARTE 9: ANÁLISE MULTIVARIADA DE COVARIÁVEIS (COVARIATE SHIFT)
+
+# =============================================================================
+
+def selecionar_features_relevantes(df_merged):
+“””
+Seleciona features de calendário relevantes para análise de covariate shift.
+
+```
+Args:
+    df_merged: DataFrame com dados completos
+    
+Returns:
+    features_selecionadas: Lista com nomes das features
+    df_features: DataFrame apenas com as features selecionadas
+"""
+print("\n📊 Selecionando features para análise de covariate shift...")
+
+# Features principais do calendário bancário
+features_candidatas = [
+    'DIA_SEMANA', 'MES', 'DIA_MES', 'SEMANA_MES',
+    'DIA_FERIADO', 'DIA_UTIL', 'DIA_FERIADO_UTIL',
+    'QTD_DIAS_FECHADO_DEPOIS_NUM', 'QTD_DIAS_FECHADO_ANTES_NUM',
+    'SEQ_DIA_UTIL', 'SEQ_DIA_UTIL_NEG',
+    'NUM_DIAS_UTEIS_MAIS_7_DIAS', 'NUM_DIAS_UTEIS_MENOS_7_DIAS',
+    'EMENDA', 'DIA_ADJACENTE_FERIADO', 'FDS_DE_FERIADO',
+    'SEMANA_QUINTO_DU', 'SEMANA_ANTERIOR_QUINTO_DU', 'SEMANA_APOS_QUINTO_DU'
+]
+
+# Verificar quais features existem no dataframe
+features_disponiveis = [f for f in features_candidatas if f in df_merged.columns]
+
+# Adicionar features DIA_MES_AJUSTADO que estiverem presentes
+features_dia_mes = [col for col in df_merged.columns if col.startswith('DIA_MES_AJUSTADO_')]
+features_disponiveis.extend(features_dia_mes[:10])  # Primeiros 10 para evitar excesso
+
+print(f"✓ Features selecionadas: {len(features_disponiveis)}")
+print(f"  Principais: {features_disponiveis[:8]}")
+
+# Criar DataFrame apenas com features selecionadas
+df_features = df_merged[['AGENCIA', 'DATA'] + features_disponiveis].copy()
+
+# Verificar e tratar valores missing
+missing_count = df_features[features_disponiveis].isnull().sum().sum()
+if missing_count > 0:
+    print(f"⚠️  Tratando {missing_count} valores missing...")
+    df_features[features_disponiveis] = df_features[features_disponiveis].fillna(0)
+
+return features_disponiveis, df_features[features_disponiveis]
+```
+
+def executar_analise_covariate_shift(df_merged, epsilon=0.92, threshold_mult=20,
+min_consecutivos=3, janela_analise=30):
+“””
+Executa análise de covariate shift nas features de entrada.
+
+```
+Args:
+    df_merged: DataFrame com dados completos
+    epsilon: Parâmetro do power martingale
+    threshold_mult: Multiplicador do threshold
+    min_consecutivos: Mínimo de detecções consecutivas
+    janela_analise: Janela para análise
+    
+Returns:
+    resultados_covariate: Dicionário com resultados da análise
+"""
+print("\n\n🔍 ANÁLISE DE COVARIATE SHIFT")
+print("="*50)
+
+# Selecionar features relevantes
+features_selecionadas, df_features = selecionar_features_relevantes(df_merged)
+
+if len(features_selecionadas) == 0:
+    print("❌ Nenhuma feature selecionada para análise!")
+    return {}
+
+print(f"\n▶️  Analisando {len(features_selecionadas)} features...")
+print(f"   Período: {len(df_features)} observações")
+
+# Calcular p-valores multivariados para as features
+print("   Calculando p-valores multivariados...")
+p_det_features, p_rnd_features = calcular_pvalores_multivariado_features(df_features)
+
+# Power martingale
+print("   Calculando Power Martingale...")
+mart_power_features = power_martingale(p_rnd_features, epsilon)
+
+# Simple Jumper martingale
+print("   Calculando Simple Jumper Martingale...")
+mart_jumper_features = simple_jumper_martingale(p_rnd_features)
+
+# Detectar mudanças
+print("   Detectando mudanças...")
+deteccoes_power, info_power = detectar_mudanca_adaptativa(
+    mart_power_features, 
+    janela=janela_analise,
+    threshold_mult=threshold_mult,
+    min_consecutivos=min_consecutivos
+)
+
+deteccoes_jumper, info_jumper = detectar_mudanca_adaptativa(
+    mart_jumper_features,
+    janela=janela_analise,
+    threshold_mult=threshold_mult,
+    min_consecutivos=min_consecutivos
+)
+
+print(f"\n✓ Detecções Power Martingale: {len(deteccoes_power)}")
+print(f"✓ Detecções Simple Jumper: {len(deteccoes_jumper)}")
+
+if deteccoes_power:
+    print(f"  Primeira detecção (Power): índice {deteccoes_power[0]}")
+if deteccoes_jumper:
+    print(f"  Primeira detecção (Jumper): índice {deteccoes_jumper[0]}")
+
+# Análise de contribuição por feature
+contribuicoes_features = analisar_contribuicao_features(
+    df_features, deteccoes_power, features_selecionadas
+)
+
+resultados_covariate = {
+    'features_analisadas': features_selecionadas,
+    'df_features': df_features,
+    'p_valores': {'det': p_det_features, 'rnd': p_rnd_features},
+    'martingale_power': mart_power_features,
+    'martingale_jumper': mart_jumper_features,
+    'deteccoes_power': deteccoes_power,
+    'deteccoes_jumper': deteccoes_jumper,
+    'info_power': info_power,
+    'info_jumper': info_jumper,
+    'contribuicoes_features': contribuicoes_features
+}
+
+return resultados_covariate
+```
+
+def calcular_pvalores_multivariado_features(df_features, rtol=1e-3, atol=1e-3):
+“””
+Calcula p-valores conformais multivariados para features.
+Adaptado para trabalhar especificamente com features de calendário.
+
+```
+Args:
+    df_features: DataFrame com features selecionadas
+    rtol, atol: Tolerâncias para comparação
+    
+Returns:
+    p_det: P-valores determinísticos
+    p_rnd: P-valores randomizados
+"""
+df_features = df_features.reset_index(drop=True)
+N = len(df_features)
+p_det = np.zeros(N)
+p_rnd = np.zeros(N)
+
+print(f"   Calculando para {N} observações...")
+
+for n in tqdm(range(N), desc="   Processando"):
+    if n == 0:
+        p_det[0] = 1
+        p_rnd[0] = 1
+        continue
+    
+    # Ponto atual
+    ponto_atual = df_features.iloc[n].values
+    
+    # Calcular distâncias aos pontos anteriores
+    distancias = []
+    for i in range(n + 1):
+        ponto_i = df_features.iloc[i].values
+        # Usar distância euclidiana normalizada
+        dist = np.linalg.norm(ponto_atual - ponto_i) / np.sqrt(len(ponto_atual))
+        distancias.append(dist)
+    
+    distancias = np.array(distancias)
+    dist_atual = distancias[n]
+    
+    # P-valor determinístico
+    p_det[n] = np.mean(distancias >= dist_atual)
+    
+    # P-valor randomizado
+    countG = np.sum(distancias > dist_atual)
+    countE = np.sum(np.isclose(distancias, dist_atual, rtol=rtol, atol=atol))
+    u = np.random.uniform() if countE > 0 else 0
+    p_rnd[n] = (countG + u * countE) / (n + 1)
+
+return p_det, p_rnd
+```
+
+def analisar_contribuicao_features(df_features, deteccoes, features_selecionadas):
+“””
+Analisa quais features mais contribuem para as detecções de drift.
+
+```
+Args:
+    df_features: DataFrame com features
+    deteccoes: Lista de índices de detecção
+    features_selecionadas: Lista de nomes das features
+    
+Returns:
+    contribuicoes: Dicionário com análise de contribuição
+"""
+if not deteccoes:
+    return {}
+
+print("   Analisando contribuição por feature...")
+
+# Para cada detecção, calcular mudança relativa em cada feature
+contribuicoes = {}
+
+for det_idx in deteccoes[:3]:  # Analisar primeiras 3 detecções
+    if det_idx < 30:  # Precisamos de histórico suficiente
+        continue
+        
+    # Período antes da detecção (30 dias)
+    periodo_antes = df_features.iloc[det_idx-30:det_idx]
+    
+    # Período da detecção (10 dias após)
+    periodo_deteccao = df_features.iloc[det_idx:min(det_idx+10, len(df_features))]
+    
+    if len(periodo_deteccao) == 0:
+        continue
+    
+    # Calcular mudanças por feature
+    mudancas_features = {}
+    
+    for feature in features_selecionadas:
+        if feature in df_features.columns:
+            # Média antes vs durante detecção
+            media_antes = periodo_antes[feature].mean()
+            media_deteccao = periodo_deteccao[feature].mean()
+            
+            # Mudança relativa (evitar divisão por zero)
+            if abs(media_antes) > 1e-6:
+                mudanca_rel = abs(media_deteccao - media_antes) / abs(media_antes)
+            else:
+                mudanca_rel = abs(media_deteccao - media_antes)
+            
+            mudancas_features[feature] = mudanca_rel
+    
+    contribuicoes[f'deteccao_{det_idx}'] = mudancas_features
+
+# Ranking geral de features mais impactantes
+if contribuicoes:
+    todas_mudancas = {}
+    for det_dict in contribuicoes.values():
+        for feature, mudanca in det_dict.items():
+            if feature not in todas_mudancas:
+                todas_mudancas[feature] = []
+            todas_mudancas[feature].append(mudanca)
+    
+    # Média das mudanças por feature
+    ranking_features = {}
+    for feature, mudancas in todas_mudancas.items():
+        ranking_features[feature] = np.mean(mudancas)
+    
+    # Ordenar por impacto
+    features_ordenadas = sorted(ranking_features.items(), 
+                               key=lambda x: x[1], reverse=True)
+    
+    contribuicoes['ranking_geral'] = features_ordenadas[:10]  # Top 10
+    
+    print(f"   Top 3 features com maior drift:")
+    for i, (feature, score) in enumerate(features_ordenadas[:3]):
+        print(f"     {i+1}. {feature}: {score:.3f}")
+
+return contribuicoes
+```
+
+def plot_analise_covariate_shift(resultados_covariate, df_merged,
+data_pandemia=‘2020-03-01’):
+“””
+Visualiza resultados da análise de covariate shift.
+
+```
+Args:
+    resultados_covariate: Resultados da análise
+    df_merged: DataFrame original
+    data_pandemia: Data de referência para pandemia
+"""
+if not resultados_covariate:
+    print("⚠️  Sem resultados para plotar!")
+    return
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+# 1. Evolução dos Martingales
+ax1 = axes[0, 0]
+mart_power = resultados_covariate['martingale_power']
+mart_jumper = resultados_covariate['martingale_jumper']
+
+ax1.plot(mart_power, label='Power Martingale', linewidth=2, color='blue')
+ax1.plot(mart_jumper, label='Simple Jumper', linewidth=2, color='red', linestyle='--')
+
+# Marcar detecções
+for det_idx in resultados_covariate['deteccoes_power']:
+    ax1.axvline(det_idx, color='blue', linestyle=':', alpha=0.7)
+
+for det_idx in resultados_covariate['deteccoes_jumper']:
+    ax1.axvline(det_idx, color='red', linestyle=':', alpha=0.7)
+
+ax1.set_yscale('log')
+ax1.set_xlabel('Tempo')
+ax1.set_ylabel('Martingale (log)')
+ax1.set_title('Martingales - Covariate Shift')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# 2. P-valores ao longo do tempo
+ax2 = axes[0, 1]
+p_valores = resultados_covariate['p_valores']['rnd']
+ax2.plot(p_valores, color='green', linewidth=1)
+ax2.axhline(y=0.05, color='red', linestyle='--', alpha=0.7, label='α=0.05')
+ax2.set_xlabel('Tempo')
+ax2.set_ylabel('P-valor')
+ax2.set_title('P-valores Conformais - Features')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+# 3. Ranking de contribuição das features
+ax3 = axes[1, 0]
+if 'ranking_geral' in resultados_covariate['contribuicoes_features']:
+    ranking = resultados_covariate['contribuicoes_features']['ranking_geral']
+    features_nomes = [item[0] for item in ranking[:10]]
+    features_scores = [item[1] for item in ranking[:10]]
+    
+    y_pos = np.arange(len(features_nomes))
+    ax3.barh(y_pos, features_scores, color='skyblue')
+    ax3.set_yticks(y_pos)
+    ax3.set_yticklabels(features_nomes, fontsize=8)
+    ax3.set_xlabel('Score de Mudança')
+    ax3.set_title('Features com Maior Drift')
+    ax3.grid(True, axis='x', alpha=0.3)
+
+# 4. Boxplot de algumas features principais
+ax4 = axes[1, 1]
+if 'ranking_geral' in resultados_covariate['contribuicoes_features']:
+    ranking = resultados_covariate['contribuicoes_features']['ranking_geral']
+    top_feature = ranking[0][0] if ranking else None
+    
+    if top_feature and top_feature in df_merged.columns:
+        # Dividir dados em pré e pós primeira detecção
+        deteccoes = resultados_covariate['deteccoes_power']
+        if deteccoes:
+            primeiro_drift = deteccoes[0]
+            
+            antes = df_merged.iloc[:primeiro_drift][top_feature]
+            depois = df_merged.iloc[primeiro_drift:][top_feature]
+            
+            data_plot = [antes.dropna(), depois.dropna()]
+            labels = ['Antes Drift', 'Após Drift']
+            
+            ax4.boxplot(data_plot, labels=labels)
+            ax4.set_title(f'Distribuição: {top_feature}')
+            ax4.set_ylabel('Valor')
+            ax4.grid(True, alpha=0.3)
+
+plt.suptitle('Análise de Covariate Shift - Features de Entrada', fontsize=16)
+plt.tight_layout()
+plt.show()
+```
+
+def comparar_drift_types(resultados_univariado, resultados_multivariado,
+resultados_covariate, df_merged):
+“””
+Compara os três tipos de análise de drift implementados.
+
+```
+Args:
+    resultados_univariado: Resultados da análise univariada
+    resultados_multivariado: Resultados da análise multivariada original
+    resultados_covariate: Resultados da análise de covariate shift
+    df_merged: DataFrame original
+"""
+print("\n\n📊 COMPARAÇÃO ENTRE TIPOS DE DRIFT")
+print("="*50)
+
+fig, axes = plt.subplots(3, 1, figsize=(15, 12))
+
+# 1. Concept Drift (erros univariados)
+ax1 = axes[0]
+cores = ['blue', 'green', 'orange', 'purple']
+variaveis = ['SAQ', 'DEP', 'SAQCEI', 'DEPCEI']
+
+for idx, var in enumerate(variaveis):
+    if var in resultados_univariado:
+        mart = resultados_univariado[var]['martingale_power']
+        ax1.plot(mart, label=f'{var}', color=cores[idx], alpha=0.7)
+        
+        # Marcar detecções
+        deteccoes = resultados_univariado[var]['deteccoes']
+        for det in deteccoes:
+            ax1.axvline(det, color=cores[idx], linestyle=':', alpha=0.5)
+
+ax1.set_yscale('log')
+ax1.set_ylabel('Martingale (log)')
+ax1.set_title('Concept Drift - Erros de Predição por Variável')
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# 2. Performance Drift (erros multivariados)
+ax2 = axes[1]
+mart_multi = resultados_multivariado['martingale_power']
+ax2.plot(mart_multi, color='red', linewidth=2, label='Multivariado')
+
+# Marcar detecções
+for det in resultados_multivariado['deteccoes']:
+    ax2.axvline(det, color='red', linestyle='--', alpha=0.7)
+
+ax2.set_yscale('log')
+ax2.set_ylabel('Martingale (log)')
+ax2.set_title('Performance Drift - Erro Conjunto das Variáveis')
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+# 3. Covariate Shift (features de entrada)
+ax3 = axes[2]
+if resultados_covariate:
+    mart_cov_power = resultados_covariate['martingale_power']
+    mart_cov_jumper = resultados_covariate['martingale_jumper']
+    
+    ax3.plot(mart_cov_power, color='darkgreen', linewidth=2, label='Power Martingale')
+    ax3.plot(mart_cov_jumper, color='brown', linewidth=2, 
+            linestyle='--', label='Simple Jumper')
+    
+    # Marcar detecções
+    for det in resultados_covariate['deteccoes_power']:
+        ax3.axvline(det, color='darkgreen', linestyle=':', alpha=0.7)
+    
+    for det in resultados_covariate['deteccoes_jumper']:
+        ax3.axvline(det, color='brown', linestyle=':', alpha=0.7)
+
+ax3.set_yscale('log')
+ax3.set_xlabel('Tempo')
+ax3.set_ylabel('Martingale (log)')
+ax3.set_title('Covariate Shift - Mudança nas Features de Entrada')
+ax3.legend()
+ax3.grid(True, alpha=0.3)
+
+plt.suptitle('Comparação: Concept Drift vs Performance Drift vs Covariate Shift', 
+            fontsize=16)
+plt.tight_layout()
+plt.show()
+
+# Resumo quantitativo
+print("\n📋 RESUMO QUANTITATIVO:")
+print("-" * 30)
+
+# Concept drift
+total_det_concept = sum(len(resultados_univariado[var]['deteccoes']) 
+                       for var in variaveis if var in resultados_univariado)
+print(f"Concept Drift (univariado): {total_det_concept} detecções totais")
+
+# Performance drift
+total_det_performance = len(resultados_multivariado['deteccoes'])
+print(f"Performance Drift (multivariado): {total_det_performance} detecções")
+
+# Covariate shift
+if resultados_covariate:
+    total_det_covariate = len(resultados_covariate['deteccoes_power'])
+    print(f"Covariate Shift (features): {total_det_covariate} detecções")
+
+print("\n💡 INTERPRETAÇÃO:")
+print("-" * 30)
+print("• Concept Drift: Mudança na relação features → target específica por variável")
+print("• Performance Drift: Degradação geral do modelo (múltiplas variáveis)")
+print("• Covariate Shift: Mudança no padrão dos dados de entrada")
+```
+
+# =============================================================================
+
+# MODIFICAÇÃO DA FUNÇÃO PRINCIPAL PARA INCLUIR COVARIATE SHIFT
+
+# =============================================================================
+
+def executar_analise_drift_completa(df_merged, janelas=[7, 30, 90], epsilon=0.92,
+threshold_mult=20, min_consecutivos=3):
+“””
+Versão estendida da função principal que inclui análise de covariate shift.
+“””
+print(”\n🚀 INICIANDO ANÁLISE COMPLETA DE DRIFT…\n”)
+
+```
+# Análise original (concept + performance drift)
+resultados_originais = executar_analise_drift(
+    df_merged, janelas, epsilon, threshold_mult, min_consecutivos
+)
+
+# Nova análise: Covariate shift
+resultados_covariate = executar_analise_covariate_shift(
+    df_merged, epsilon, threshold_mult, min_consecutivos, janelas[1]
+)
+
+# Compilar resultados completos
+resultados_completos = {
+    'univariado': resultados_originais['univariado'],
+    'multivariado': resultados_originais['multivariado'],
+    'covariate_shift': resultados_covariate,
+    'janelas': resultados_originais['janelas'],
+    'config': resultados_originais['config']
+}
+
+# Visualizações comparativas
+if resultados_covariate:
+    print("\n📈 GERANDO VISUALIZAÇÕES ESTENDIDAS...")
+    
+    # Plot específico do covariate shift
+    plot_analise_covariate_shift(resultados_covariate, df_merged)
+    
+    # Comparação entre todos os tipos
+    comparar_drift_types(
+        resultados_originais['univariado'],
+        resultados_originais['multivariado'], 
+        resultados_covariate,
+        df_merged
+    )
+
+return resultados_completos
+```
+
+# =============================================================================
+
+# EXEMPLO DE USO MODIFICADO
+
+# =============================================================================
+
+“””
+
+# Para usar a nova funcionalidade, substitua a chamada original:
+
+# ANTES:
+
+# resultados = executar_analise_drift(df_merged, …)
+
+# DEPOIS:
+
+resultados_completos = executar_analise_drift_completa(
+df_merged,
+janelas=[7, 30, 90],
+epsilon=0.92,
+threshold_mult=20,
+min_consecutivos=3
+)
+
+# Acessar resultados:
+
+covariate_results = resultados_completos[‘covariate_shift’]
+if covariate_results[‘deteccoes_power’]:
+print(“Covariate shift detectado!”)
+print(f”Features mais impactantes: {covariate_results[‘contribuicoes_features’][‘ranking_geral’][:3]}”)
+“””
